@@ -131,10 +131,16 @@ app.post('/crear-preferencia', async (req, res) => {
             return res.status(400).json({ error: 'No hay productos' });
         }
 
-        const totalFinal = Number(orderData.total || 0);
+        console.log('📦 BODY RECIBIDO:', JSON.stringify(req.body, null, 2));
 
-        if (!totalFinal || totalFinal <= 0) {
-            return res.status(400).json({ error: 'Total inválido para Mercado Pago' });
+        const totalFinal = Number(orderData?.total);
+
+        if (!totalFinal || totalFinal <= 0 || isNaN(totalFinal)) {
+            console.error('❌ Total inválido recibido:', orderData);
+            return res.status(400).json({
+                error: 'Total inválido para Mercado Pago',
+                orderData
+            });
         }
 
         // 🔥 CLAVE: referencia única SIEMPRE
