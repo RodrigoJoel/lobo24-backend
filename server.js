@@ -28,10 +28,12 @@ const mpClient = new MercadoPagoConfig({
     accessToken: process.env.MP_ACCESS_TOKEN
 });
 
-// ===================== BREVO (EMAILS) =====================
+// ===================== BREVO (EMAILS) - VERSIÓN CORREGIDA =====================
 const brevo = require('@getbrevo/brevo');
-let brevoApiInstance = new brevo.TransactionalEmailsApi();
-brevoApiInstance.setApiKey(brevo.TransactionalEmailsApiApiKeys.apiKey, process.env.BREVO_API_KEY);
+
+// Método correcto de inicialización
+const brevoApiInstance = new brevo.TransactionalEmailsApi();
+brevoApiInstance.setApiKey('api-key', process.env.BREVO_API_KEY);
 
 const BREVO_SENDER = {
     name: process.env.BREVO_SENDER_NAME || 'Lobo24',
@@ -122,8 +124,10 @@ function extraerCampos(fields) {
         else if (v.doubleValue !== undefined) result[k] = Number(v.doubleValue);
         else if (v.booleanValue !== undefined) result[k] = v.booleanValue;
         else if (v.arrayValue !== undefined) {
-            // Manejar arrays si es necesario
-            result[k] = v.arrayValue.values || [];
+            result[k] = (v.arrayValue.values || []).map(item => {
+                if (item.mapValue) return extraerCampos(item.mapValue.fields);
+                return item;
+            });
         }
     }
 
@@ -232,6 +236,9 @@ async function enviarEmailBrevo(destinatario, asunto, htmlContent) {
         return { success: true, messageId: response.messageId };
     } catch (error) {
         console.error(`❌ Error enviando email a ${destinatario}:`, error.message);
+        if (error.response) {
+            console.error('Detalle:', error.response.body);
+        }
         return { success: false, error: error.message };
     }
 }
@@ -282,6 +289,7 @@ app.post('/test-brevo', async (req, res) => {
         );
         res.json(result);
     } catch(e) {
+        console.error('Error en test-brevo:', e);
         res.status(500).json({ error: e.message });
     }
 });
@@ -381,7 +389,6 @@ app.post('/webhook', async (req, res) => {
 
             console.log('✅ Pedido confirmado:', orderId);
             
-            // Enviar emails con Brevo
             await enviarEmailsPedido({
                 ...pedido,
                 status: 'payment_confirmed',
