@@ -28,11 +28,16 @@ const mpClient = new MercadoPagoConfig({
     accessToken: process.env.MP_ACCESS_TOKEN
 });
 
-const { Resend } = require('resend');
+// ===================== BREVO (EMAILS) =====================
+const brevo = require('@getbrevo/brevo');
+let brevoApiInstance = new brevo.TransactionalEmailsApi();
+brevoApiInstance.setApiKey(brevo.TransactionalEmailsApiApiKeys.apiKey, process.env.BREVO_API_KEY);
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+const BREVO_SENDER = {
+    name: process.env.BREVO_SENDER_NAME || 'Lobo24',
+    email: process.env.BREVO_SENDER_EMAIL || 'onboarding@resend.dev'
+};
 const SELLER_EMAIL = process.env.SELLER_EMAIL || 'marketlobo24@gmail.com';
-const FROM_EMAIL = process.env.FROM_EMAIL || 'Lobo24 <onboarding@resend.dev>';
 
 // ===================== FIREBASE =====================
 
@@ -116,6 +121,10 @@ function extraerCampos(fields) {
         else if (v.integerValue !== undefined) result[k] = Number(v.integerValue);
         else if (v.doubleValue !== undefined) result[k] = Number(v.doubleValue);
         else if (v.booleanValue !== undefined) result[k] = v.booleanValue;
+        else if (v.arrayValue !== undefined) {
+            // Manejar arrays si es necesario
+            result[k] = v.arrayValue.values || [];
+        }
     }
 
     return result;
@@ -144,37 +153,37 @@ function buildPedidoEmailHtml(pedido, tipo = 'cliente') {
   const items = pedido.items || [];
   const contact = pedido.contact || {};
 
-  const productosHtml = items.map(item => `
+  const productosHtml = items.length > 0 ? items.map(item => `
     <tr>
       <td style="padding:8px;border-bottom:1px solid #eee">${item.name || ''}</td>
       <td style="padding:8px;border-bottom:1px solid #eee;text-align:center">${item.qty || 1}</td>
       <td style="padding:8px;border-bottom:1px solid #eee;text-align:right">${money(item.price)}</td>
       <td style="padding:8px;border-bottom:1px solid #eee;text-align:right">${money(item.subtotal || Number(item.price || 0) * Number(item.qty || 1))}</td>
     </tr>
-  `).join('');
+  `).join('') : '<tr><td colspan="4" style="padding:12px;text-align:center">Sin productos</td></tr>';
 
   return `
     <div style="font-family:Arial,sans-serif;background:#f6f6f6;padding:24px;color:#222">
       <div style="max-width:680px;margin:auto;background:#fff;border-radius:14px;overflow:hidden;border:1px solid #e5e5e5">
         <div style="background:#111827;color:#fff;padding:22px">
           <h1 style="margin:0;font-size:26px">LOBO24</h1>
-          <p style="margin:6px 0 0">${tipo === 'vendedor' ? 'Nuevo pedido recibido' : 'Confirmación de compra'}</p>
+          <p style="margin:6px 0 0">${tipo === 'vendedor' ? '🛒 Nuevo pedido recibido' : '✅ Confirmación de tu compra'}</p>
         </div>
 
         <div style="padding:22px">
           <h2 style="margin-top:0">Pedido #${pedido.orderId || pedido.orderNumber || pedido.docId || ''}</h2>
 
-          <p><strong>Cliente:</strong> ${contact.name || '—'}</p>
-          <p><strong>Email:</strong> ${contact.email || '—'}</p>
-          <p><strong>Teléfono:</strong> ${contact.phone || '—'}</p>
-          <p><strong>Dirección:</strong> ${(contact.street || '')}, ${(contact.city || '')}, ${(contact.province || '')}</p>
-          <p><strong>Notas:</strong> ${contact.notes || '—'}</p>
+          <p><strong>👤 Cliente:</strong> ${contact.name || '—'}</p>
+          <p><strong>📧 Email:</strong> ${contact.email || '—'}</p>
+          <p><strong>📱 Teléfono:</strong> ${contact.phone || '—'}</p>
+          <p><strong>📍 Dirección:</strong> ${[contact.street, contact.city, contact.province].filter(Boolean).join(', ') || '—'}</p>
+          ${contact.notes ? `<p><strong>📝 Notas:</strong> ${contact.notes}</p>` : ''}
 
           <hr style="border:none;border-top:1px solid #eee;margin:18px 0">
 
-          <p><strong>Pago:</strong> ${paymentLabel(pedido.payment)}</p>
-          <p><strong>Entrega:</strong> ${deliveryLabel(pedido.delivery)}</p>
-          <p><strong>Estado:</strong> ${pedido.status || '—'}</p>
+          <p><strong>💳 Pago:</strong> ${paymentLabel(pedido.payment)}</p>
+          <p><strong>🚚 Entrega:</strong> ${deliveryLabel(pedido.delivery)}</p>
+          <p><strong>📊 Estado:</strong> ${pedido.status || '—'}</p>
 
           <table style="width:100%;border-collapse:collapse;margin-top:18px">
             <thead>
@@ -191,55 +200,90 @@ function buildPedidoEmailHtml(pedido, tipo = 'cliente') {
           <div style="margin-top:18px;text-align:right">
             <p><strong>Subtotal:</strong> ${money(pedido.subtotal)}</p>
             <p><strong>Envío:</strong> ${Number(pedido.deliveryCost || 0) === 0 ? 'Gratis' : money(pedido.deliveryCost)}</p>
-            ${Number(pedido.pointsUsed || 0) > 0 ? `<p><strong>Descuento puntos:</strong> -${money(pedido.pointsUsed)}</p>` : ''}
-            <h2 style="margin-bottom:0">Total: ${money(pedido.total)}</h2>
+            ${Number(pedido.pointsUsed || 0) > 0 ? `<p><strong>⭐ Descuento puntos:</strong> -${money(pedido.pointsUsed)}</p>` : ''}
+            <h2 style="margin-bottom:0">💰 Total: ${money(pedido.total)}</h2>
           </div>
+          
+          ${pedido.payment === 'transfer' ? `
+          <div style="margin-top:20px;padding:15px;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px">
+            <p style="margin:0 0 6px;font-weight:700">📌 Completá tu pago por transferencia:</p>
+            <p style="margin:4px 0;font-size:13px;">Alias: <strong>LOBO24.PAGO</strong></p>
+            <p style="margin:4px 0;font-size:13px;">CBU: <strong>0110599920000012345678</strong></p>
+            <p style="margin:4px 0;font-size:13px;">Monto exacto: <strong>${money(pedido.total)}</strong></p>
+          </div>
+          ` : ''}
         </div>
       </div>
     </div>
   `;
 }
 
+// Función para enviar email con Brevo
+async function enviarEmailBrevo(destinatario, asunto, htmlContent) {
+    try {
+        const sendSmtpEmail = new brevo.SendSmtpEmail();
+        sendSmtpEmail.sender = BREVO_SENDER;
+        sendSmtpEmail.to = [{ email: destinatario }];
+        sendSmtpEmail.subject = asunto;
+        sendSmtpEmail.htmlContent = htmlContent;
+        
+        const response = await brevoApiInstance.sendTransacEmail(sendSmtpEmail);
+        console.log(`📧 Email enviado a ${destinatario} | ID: ${response.messageId}`);
+        return { success: true, messageId: response.messageId };
+    } catch (error) {
+        console.error(`❌ Error enviando email a ${destinatario}:`, error.message);
+        return { success: false, error: error.message };
+    }
+}
+
 async function enviarEmailsPedido(pedido) {
-  if (!process.env.RESEND_API_KEY) {
-    console.warn('⚠️ Falta RESEND_API_KEY. No se enviaron emails.');
+  if (!process.env.BREVO_API_KEY) {
+    console.warn('⚠️ Falta BREVO_API_KEY. No se enviaron emails.');
     return;
   }
 
   const clienteEmail = pedido.contact?.email;
+  const orderNum = pedido.orderId || pedido.orderNumber || pedido.docId || '';
+  
+  console.log('📧 Iniciando envío de emails para pedido:', orderNum);
 
-  const emails = [];
-
-  if (clienteEmail) {
-    emails.push({
-      from: FROM_EMAIL,
-      to: [clienteEmail],
-      subject: `Confirmación de compra Lobo24 #${pedido.orderId || pedido.orderNumber || ''}`,
-      html: buildPedidoEmailHtml(pedido, 'cliente')
-    });
+  // Email al cliente
+  if (clienteEmail && clienteEmail !== '') {
+    await enviarEmailBrevo(
+      clienteEmail,
+      `✅ Compra confirmada en Lobo24 — Pedido #${orderNum}`,
+      buildPedidoEmailHtml(pedido, 'cliente')
+    );
+  } else {
+    console.warn('⚠️ Cliente sin email, no se envía confirmación');
   }
 
-  emails.push({
-    from: FROM_EMAIL,
-    to: [SELLER_EMAIL],
-    subject: `Nuevo pedido Lobo24 #${pedido.orderId || pedido.orderNumber || ''}`,
-    html: buildPedidoEmailHtml(pedido, 'vendedor')
-  });
-
-  for (const email of emails) {
-    const { error } = await resend.emails.send(email);
-    if (error) {
-      console.error('❌ Error enviando email:', error);
-    } else {
-      console.log('📩 Email enviado:', email.to.join(', '));
-    }
-  }
+  // Email al vendedor
+  await enviarEmailBrevo(
+    SELLER_EMAIL,
+    `🛒 Nuevo pedido en Lobo24 — #${orderNum} — ${money(pedido.total)}`,
+    buildPedidoEmailHtml(pedido, 'vendedor')
+  );
 }
 
 // ===================== RUTAS =====================
 
 app.get('/', (req, res) => {
-    res.json({ status: 'ok', message: 'Servidor Lobo24 funcionando!' });
+    res.json({ status: 'ok', message: 'Servidor Lobo24 funcionando!', email_service: 'Brevo' });
+});
+
+// Ruta de prueba para Brevo
+app.post('/test-brevo', async (req, res) => {
+    try {
+        const result = await enviarEmailBrevo(
+            SELLER_EMAIL,
+            '✅ Test Lobo24 - Brevo funcionando',
+            '<h1>¡Perfecto!</h1><p>Brevo está configurado correctamente en tu servidor.</p><p>Fecha: ' + new Date().toLocaleString() + '</p>'
+        );
+        res.json(result);
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
 // ===================== CREAR PREFERENCIA =====================
@@ -252,62 +296,46 @@ app.post('/crear-preferencia', async (req, res) => {
             return res.status(400).json({ error: 'No hay productos' });
         }
 
-        console.log('📦 BODY RECIBIDO:', JSON.stringify(req.body, null, 2));
+        console.log('📦 Creando preferencia para:', customerData?.email);
 
         const totalFinal = Number(orderData?.total);
 
         if (!totalFinal || totalFinal <= 0 || isNaN(totalFinal)) {
-            console.error('❌ Total inválido recibido:', orderData);
-            return res.status(400).json({
-                error: 'Total inválido para Mercado Pago',
-                orderData
-            });
+            console.error('❌ Total inválido:', orderData);
+            return res.status(400).json({ error: 'Total inválido para Mercado Pago' });
         }
 
-        // 🔥 CLAVE: referencia única SIEMPRE
-        const externalReference =
-            orderData.orderId ||
-            orderData.orderNumber ||
-            `LOBO-${Date.now()}`;
-
-        const mpItems = [
-            {
-                id: externalReference,
-                title: `Pedido Lobo24 ${externalReference}`,
-                quantity: 1,
-                unit_price: totalFinal,
-                currency_id: 'ARS'
-            }
-        ];
+        const externalReference = orderData.orderId || orderData.orderNumber || `LOBO-${Date.now()}`;
 
         const preference = new Preference(mpClient);
 
         const result = await preference.create({
             body: {
-                items: mpItems,
+                items: [{
+                    id: externalReference,
+                    title: `Pedido Lobo24 ${externalReference}`,
+                    quantity: 1,
+                    unit_price: totalFinal,
+                    currency_id: 'ARS'
+                }],
                 payer: {
-                    name: customerData.name,
-                    email: customerData.email,
-                    phone: { number: customerData.phone }
+                    name: customerData?.name || '',
+                    email: customerData?.email || '',
+                    phone: { number: String(customerData?.phone || '') }
                 },
-
                 external_reference: externalReference,
                 statement_descriptor: 'LOBO24',
-
                 back_urls: {
                     success: `${process.env.FRONTEND_URL}/checkout.html?mp_status=success&order=${externalReference}`,
                     failure: `${process.env.FRONTEND_URL}/checkout.html?mp_status=failure&order=${externalReference}`,
                     pending: `${process.env.FRONTEND_URL}/checkout.html?mp_status=pending&order=${externalReference}`
                 },
-
                 auto_return: 'approved',
-
                 notification_url: `${process.env.BACKEND_URL}/webhook`
             }
         });
 
-        console.log('✅ Preferencia creada:', result.id, '| Orden:', externalReference);
-
+        console.log('✅ Preferencia creada:', result.id);
         res.json({
             id: result.id,
             init_point: result.init_point,
@@ -336,46 +364,71 @@ app.post('/webhook', async (req, res) => {
         const status  = payInfo.status;
         const orderId = payInfo.external_reference;
 
-        console.log('💳 Pago:', status, '| Orden:', orderId);
+        console.log('💳 Webhook - Pago:', status, '| Orden:', orderId);
 
         const pedido = await buscarPedidoPorOrderId(orderId);
 
-        if (!pedido) return;
+        if (!pedido) {
+            console.warn('⚠️ Pedido no encontrado:', orderId);
+            return;
+        }
 
         if (status === 'approved') {
-
             await firestorePatch('pedidos', pedido.docId, {
                 status: 'payment_confirmed',
                 mpPaymentId: String(data.id)
             });
 
-            console.log('✅ Pedido aprobado');
+            console.log('✅ Pedido confirmado:', orderId);
+            
+            // Enviar emails con Brevo
             await enviarEmailsPedido({
                 ...pedido,
                 status: 'payment_confirmed',
                 mpPaymentId: String(data.id)
-                });
+            });
 
         } else if (status === 'rejected') {
-
             await firestorePatch('pedidos', pedido.docId, {
-                status: 'cancelled'
+                status: 'cancelled',
+                mpPaymentId: String(data.id)
             });
-
+            console.log('❌ Pago rechazado:', orderId);
         } else if (status === 'pending') {
-
             await firestorePatch('pedidos', pedido.docId, {
-                status: 'pending_payment'
+                status: 'pending_payment',
+                mpPaymentId: String(data.id)
             });
+            console.log('⏳ Pago pendiente:', orderId);
         }
 
     } catch (err) {
-        console.error('❌ Error webhook:', err);
+        console.error('❌ Error en webhook:', err.message);
+    }
+});
+
+// Endpoint manual para enviar email (para transferencia/efectivo)
+app.post('/enviar-email-pedido', async (req, res) => {
+    try {
+        const { pedido } = req.body;
+        if (!pedido) {
+            return res.status(400).json({ error: 'Falta el pedido' });
+        }
+        await enviarEmailsPedido(pedido);
+        res.json({ ok: true, message: 'Emails enviados correctamente' });
+    } catch(e) {
+        console.error('❌ Error enviando email manual:', e);
+        res.status(500).json({ error: 'Error al enviar email' });
     }
 });
 
 // ===================== START =====================
 
 app.listen(PORT, () => {
-    console.log(`🚀 Servidor en http://localhost:${PORT}`);
+    console.log(`\n🚀 Servidor Lobo24 corriendo en http://localhost:${PORT}`);
+    console.log(`📦 Mercado Pago: ${process.env.MP_ACCESS_TOKEN ? '✅ Configurado' : '❌ Falta token'}`);
+    console.log(`📧 Brevo: ${process.env.BREVO_API_KEY ? '✅ Configurado' : '❌ Falta API key'}`);
+    console.log(`📧 Email vendedor: ${SELLER_EMAIL}`);
+    console.log(`🌐 Frontend: ${process.env.FRONTEND_URL}`);
+    console.log(`🔔 Webhook: ${process.env.BACKEND_URL}/webhook\n`);
 });
