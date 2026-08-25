@@ -149,6 +149,68 @@ function extraerCampos(fields) {
     return result;
 }
 
+// ===================== VALIDACIÓN DE PRECIOS (ANTI-TAMPERING) =====================
+// El total que se le cobra al cliente en Mercado Pago NUNCA debe salir
+// de un valor que mandó el navegador. Acá se recalcula desde los
+// precios reales guardados en Firestore.
+//
+// ⚠️ SHIPPING debe mantenerse igual a la constante SHIPPING de
+// checkout.js (js/checkout.js). Si cambia ahí, hay que cambiarla acá.
+const SHIPPING = {
+    LOCAL_MIN: 85000,
+    COSTO_FIJO: 4500
+};
+
+async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId) {
+    let subtotal = 0;
+
+    for (const item of items) {
+        if (!item || !item.coleccion || !item.id) {
+            throw new Error('Item sin coleccion/id válidos');
+        }
+
+        const qty = Number(item.quantity || 0);
+        if (!Number.isFinite(qty) || qty <= 0) {
+            throw new Error(`Cantidad inválida para ${item.id}`);
+        }
+
+        const doc = await firestoreGet(item.coleccion, item.id);
+        if (!doc) {
+            throw new Error(`Producto no encontrado: ${item.coleccion}/${item.id}`);
+        }
+
+        const campos = extraerCampos(doc.fields);
+        const precioReal = Number(campos.price || 0);
+
+        if (!Number.isFinite(precioReal) || precioReal <= 0) {
+            throw new Error(`Precio inválido para ${item.coleccion}/${item.id}`);
+        }
+
+        subtotal += precioReal * qty;
+    }
+
+    const deliveryCost = delivery === 'local'
+        ? 0
+        : (subtotal >= SHIPPING.LOCAL_MIN ? 0 : SHIPPING.COSTO_FIJO);
+
+    let pointsUsed = 0;
+    const pointsSolicitados = Number(pointsUsedSolicitado || 0);
+
+    if (pointsSolicitados > 0 && userId) {
+        const userDoc = await firestoreGet('users', userId);
+        if (userDoc) {
+            const userFields = extraerCampos(userDoc.fields);
+            const puntosDisponibles = Number(userFields.points || 0);
+            const maxAplicable = Math.floor((subtotal + deliveryCost) * 0.30);
+            pointsUsed = Math.max(0, Math.min(pointsSolicitados, puntosDisponibles, maxAplicable));
+        }
+    }
+
+    const total = Math.max(0, subtotal + deliveryCost - pointsUsed);
+
+    return { subtotal, deliveryCost, pointsUsed, total };
+}
+
 // ===================== HELPERS DE EMAIL =====================
 
 function money(n) {
@@ -448,20 +510,46 @@ app.post('/crear-preferencia', async (req, res) => {
 
         console.log('📦 BODY RECIBIDO:', JSON.stringify(req.body, null, 2));
 
-        const totalFinal = Number(orderData?.total);
+        let totalFinal, subtotal, deliveryCost, pointsUsed;
 
-        if (!totalFinal || totalFinal <= 0 || isNaN(totalFinal)) {
-            console.error('❌ Total inválido recibido:', orderData);
-            return res.status(400).json({
-                error: 'Total inválido para Mercado Pago',
-                orderData
-            });
+        try {
+            ({ total: totalFinal, subtotal, deliveryCost, pointsUsed } = await calcularTotalReal(
+                items,
+                orderData?.delivery,
+                orderData?.pointsUsed,
+                orderData?.userId
+            ));
+        } catch (validationError) {
+            console.error('❌ No se pudo validar el pedido contra Firestore:', validationError.message);
+            return res.status(400).json({ error: 'No se pudo validar el pedido: ' + validationError.message });
+        }
+
+        if (!totalFinal || totalFinal <= 0) {
+            console.error('❌ Total calculado inválido:', { totalFinal, orderData });
+            return res.status(400).json({ error: 'Total inválido para Mercado Pago' });
         }
 
         const externalReference =
             orderData.orderId ||
             orderData.orderNumber ||
             `LOBO-${Date.now()}`;
+
+        // El pedido ya existe en Firestore (lo crea checkout.js antes de
+        // llamar acá). Lo actualizamos con los valores validados para que
+        // el registro coincida con lo que realmente se le va a cobrar.
+        try {
+            const pedidoExistente = await buscarPedidoPorOrderId(externalReference);
+            if (pedidoExistente) {
+                await firestorePatch('pedidos', pedidoExistente.docId, {
+                    subtotal,
+                    deliveryCost,
+                    pointsUsed,
+                    total: totalFinal
+                });
+            }
+        } catch (patchError) {
+            console.warn('⚠️ No se pudo sincronizar el pedido con el total validado:', patchError.message);
+        }
 
         const mpItems = [
             {
