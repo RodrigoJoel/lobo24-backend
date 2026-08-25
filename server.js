@@ -120,12 +120,38 @@ async function buscarPedidoPorOrderId(orderId) {
 // de un valor que mandó el navegador. Acá se recalcula desde los
 // precios reales guardados en Firestore.
 //
-// ⚠️ SHIPPING debe mantenerse igual a la constante SHIPPING de
-// checkout.js (js/checkout.js). Si cambia ahí, hay que cambiarla acá.
-const SHIPPING = {
+// El costo de envío sale de config/shipping en Firestore (mismo doc que
+// lee js/checkout.js), para que exista un solo lugar donde cambiarlo en
+// vez de dos constantes hardcodeadas que había que mantener sincronizadas
+// a mano. Si el doc no existe todavía, se usan estos valores por defecto
+// (los mismos que estaban hardcodeados antes).
+const DEFAULT_SHIPPING = {
     LOCAL_MIN: 85000,
     COSTO_FIJO: 4500
 };
+
+let shippingConfigCache = { ...DEFAULT_SHIPPING };
+let shippingConfigFetchedAt = 0;
+const SHIPPING_CONFIG_TTL_MS = 5 * 60 * 1000;
+
+async function getShippingConfig() {
+    if (Date.now() - shippingConfigFetchedAt < SHIPPING_CONFIG_TTL_MS) {
+        return shippingConfigCache;
+    }
+    try {
+        const doc = await firestoreGet('config', 'shipping');
+        if (doc) {
+            shippingConfigCache = {
+                LOCAL_MIN: Number(doc.localMin ?? DEFAULT_SHIPPING.LOCAL_MIN),
+                COSTO_FIJO: Number(doc.costoFijo ?? DEFAULT_SHIPPING.COSTO_FIJO)
+            };
+        }
+        shippingConfigFetchedAt = Date.now();
+    } catch (err) {
+        console.error('⚠️ No se pudo leer config/shipping, se usan los valores por defecto:', err.message);
+    }
+    return shippingConfigCache;
+}
 
 async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId) {
     let subtotal = 0;
@@ -154,6 +180,7 @@ async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId) 
         subtotal += precioReal * qty;
     }
 
+    const SHIPPING = await getShippingConfig();
     const deliveryCost = delivery === 'local'
         ? 0
         : (subtotal >= SHIPPING.LOCAL_MIN ? 0 : SHIPPING.COSTO_FIJO);
