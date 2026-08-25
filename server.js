@@ -62,91 +62,57 @@ const FROM_EMAIL       = process.env.BREVO_SENDER_EMAIL || 'onboarding@resend.de
 const FROM_NAME        = process.env.BREVO_SENDER_NAME  || 'Lobo24';
 const STORE_WHATSAPP   = '543624235455'; // número con código de país sin +
 
-// ===================== FIREBASE =====================
+// ===================== FIREBASE (Admin SDK) =====================
+// Usamos credenciales de cuenta de servicio (no la API key pública) porque
+// las Firestore Security Rules exigen ser admin autenticado para escribir
+// "pedidos" o leer "users". La API key web NO es secreta (está a la vista
+// en el código de cualquier página), así que no hay forma de darle acceso
+// elevado a través de ella sin reabrir el mismo agujero que se cerró al
+// bloquear la base de datos. El Admin SDK, en cambio, usa una credencial
+// real que solo vive en las variables de entorno del backend y pasa por
+// encima de las reglas, como corresponde a un servidor de confianza.
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getFirestore } = require('firebase-admin/firestore');
 
-const FIREBASE_PROJECT  = process.env.FIREBASE_PROJECT;
-const FIREBASE_API_KEY  = process.env.FIREBASE_API_KEY;
+let db = null;
+
+if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    try {
+        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+        const firebaseApp = initializeApp({ credential: cert(serviceAccount) });
+        db = getFirestore(firebaseApp);
+        console.log('✅ Firebase Admin SDK inicializado');
+    } catch (err) {
+        console.error('❌ FIREBASE_SERVICE_ACCOUNT_JSON inválido:', err.message);
+    }
+} else {
+    console.error('❌ Falta FIREBASE_SERVICE_ACCOUNT_JSON. El servidor no va a poder leer/escribir Firestore.');
+}
 
 // Obtener doc
 async function firestoreGet(collection, docId) {
-    const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT}/databases/(default)/documents/${collection}/${docId}?key=${FIREBASE_API_KEY}`;
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    return await res.json();
+    const snap = await db.collection(collection).doc(docId).get();
+    return snap.exists ? snap.data() : null;
 }
 
 // Actualizar doc
 async function firestorePatch(collection, docId, fields) {
-    const fieldPaths = Object.keys(fields).map(k => `updateMask.fieldPaths=${k}`).join('&');
-
-    const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT}/databases/(default)/documents/${collection}/${docId}?${fieldPaths}&key=${FIREBASE_API_KEY}`;
-
-    const firestoreFields = {};
-
-    for (const [k, v] of Object.entries(fields)) {
-        if (typeof v === 'string') firestoreFields[k] = { stringValue: v };
-        else if (typeof v === 'number') firestoreFields[k] = { integerValue: String(Math.floor(v)) };
-        else if (typeof v === 'boolean') firestoreFields[k] = { booleanValue: v };
+    try {
+        await db.collection(collection).doc(docId).update(fields);
+        return true;
+    } catch (err) {
+        console.error(`❌ Error actualizando ${collection}/${docId}:`, err.message);
+        return false;
     }
-
-    const res = await fetch(url, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fields: firestoreFields })
-    });
-
-    return res.ok;
 }
 
 // Buscar pedido por orderId
 async function buscarPedidoPorOrderId(orderId) {
-    const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT}/databases/(default)/documents:runQuery?key=${FIREBASE_API_KEY}`;
+    const snap = await db.collection('pedidos').where('orderId', '==', orderId).limit(1).get();
+    if (snap.empty) return null;
 
-    const body = {
-        structuredQuery: {
-            from: [{ collectionId: 'pedidos' }],
-            where: {
-                fieldFilter: {
-                    field: { fieldPath: 'orderId' },
-                    op: 'EQUAL',
-                    value: { stringValue: orderId }
-                }
-            },
-            limit: 1
-        }
-    };
-
-    const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-    });
-
-    if (!res.ok) return null;
-
-    const data = await res.json();
-
-    if (!data || !data[0] || !data[0].document) return null;
-
-    const doc = data[0].document;
-    const docId = doc.name.split('/').pop();
-
-    return { docId, ...extraerCampos(doc.fields) };
-}
-
-// Convertir campos Firestore → JS
-function extraerCampos(fields) {
-    if (!fields) return {};
-    const result = {};
-
-    for (const [k, v] of Object.entries(fields)) {
-        if (v.stringValue !== undefined) result[k] = v.stringValue;
-        else if (v.integerValue !== undefined) result[k] = Number(v.integerValue);
-        else if (v.doubleValue !== undefined) result[k] = Number(v.doubleValue);
-        else if (v.booleanValue !== undefined) result[k] = v.booleanValue;
-    }
-
-    return result;
+    const doc = snap.docs[0];
+    return { docId: doc.id, ...doc.data() };
 }
 
 // ===================== VALIDACIÓN DE PRECIOS (ANTI-TAMPERING) =====================
@@ -174,13 +140,12 @@ async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId) 
             throw new Error(`Cantidad inválida para ${item.id}`);
         }
 
-        const doc = await firestoreGet(item.coleccion, item.id);
-        if (!doc) {
+        const producto = await firestoreGet(item.coleccion, item.id);
+        if (!producto) {
             throw new Error(`Producto no encontrado: ${item.coleccion}/${item.id}`);
         }
 
-        const campos = extraerCampos(doc.fields);
-        const precioReal = Number(campos.price || 0);
+        const precioReal = Number(producto.price || 0);
 
         if (!Number.isFinite(precioReal) || precioReal <= 0) {
             throw new Error(`Precio inválido para ${item.coleccion}/${item.id}`);
@@ -197,10 +162,9 @@ async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId) 
     const pointsSolicitados = Number(pointsUsedSolicitado || 0);
 
     if (pointsSolicitados > 0 && userId) {
-        const userDoc = await firestoreGet('users', userId);
-        if (userDoc) {
-            const userFields = extraerCampos(userDoc.fields);
-            const puntosDisponibles = Number(userFields.points || 0);
+        const usuario = await firestoreGet('users', userId);
+        if (usuario) {
+            const puntosDisponibles = Number(usuario.points || 0);
             const maxAplicable = Math.floor((subtotal + deliveryCost) * 0.30);
             pointsUsed = Math.max(0, Math.min(pointsSolicitados, puntosDisponibles, maxAplicable));
         }
@@ -209,6 +173,36 @@ async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId) 
     const total = Math.max(0, subtotal + deliveryCost - pointsUsed);
 
     return { subtotal, deliveryCost, pointsUsed, total };
+}
+
+// ===================== DESCUENTO DE STOCK (pedidos pagados con Mercado Pago) =====================
+// checkout.js ya descuenta el stock en el momento para transferencia/
+// efectivo (el cliente confirma en persona). Para Mercado Pago, el stock
+// recién se descuenta acá, cuando el webhook confirma el pago — nunca
+// antes, para no restar stock de pedidos que el cliente nunca terminó de pagar.
+async function descontarStockPedido(pedido) {
+    const items = pedido.items || [];
+
+    for (const item of items) {
+        if (!item?.coleccion || !item?.docId) continue;
+
+        try {
+            const productoRef = db.collection(item.coleccion).doc(item.docId);
+
+            await db.runTransaction(async (tx) => {
+                const snap = await tx.get(productoRef);
+                if (!snap.exists) return;
+
+                const stockActual = snap.data().stock;
+                if (stockActual === undefined || stockActual === null) return; // producto sin control de stock
+
+                const nuevoStock = Math.max(0, Number(stockActual) - Number(item.qty || 0));
+                tx.update(productoRef, { stock: nuevoStock });
+            });
+        } catch (err) {
+            console.error(`❌ Error descontando stock de ${item.coleccion}/${item.docId}:`, err.message);
+        }
+    }
 }
 
 // ===================== HELPERS DE EMAIL =====================
@@ -645,17 +639,27 @@ app.post('/webhook', async (req, res) => {
 
         if (status === 'approved') {
 
+            // Mercado Pago puede reenviar la misma notificación más de una
+            // vez. Si el pedido ya estaba confirmado, no volvemos a
+            // descontar stock ni a reenviar el email.
+            const yaEstabaConfirmado = pedido.status === 'payment_confirmed';
+
             await firestorePatch('pedidos', pedido.docId, {
                 status: 'payment_confirmed',
                 mpPaymentId: String(data.id)
             });
 
-            console.log('✅ Pedido aprobado');
-            await enviarEmailsPedido({
-                ...pedido,
-                status: 'payment_confirmed',
-                mpPaymentId: String(data.id)
-            });
+            if (yaEstabaConfirmado) {
+                console.log('ℹ️ Pedido ya estaba confirmado, se ignora la notificación repetida');
+            } else {
+                await descontarStockPedido(pedido);
+                console.log('✅ Pedido aprobado, stock descontado');
+                await enviarEmailsPedido({
+                    ...pedido,
+                    status: 'payment_confirmed',
+                    mpPaymentId: String(data.id)
+                });
+            }
 
         } else if (status === 'rejected') {
 
