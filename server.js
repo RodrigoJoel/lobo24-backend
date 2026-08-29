@@ -667,13 +667,17 @@ const COLECCIONES_VALIDAS_LOBO24 = [
     'congelados', 'lacteos', 'panaderia', 'mascotas', 'ofertas'
 ];
 
+// Acepta stock y/o price — el nombre de la ruta quedó del alcance
+// original (solo stock), pero ahora también sincroniza precio: ninguno de
+// los dos se puede tocar sin login en las reglas de Lobo24, así que los
+// dos necesitan pasar por acá, verificados igual.
 app.post('/sincronizar-stock-pos', async (req, res) => {
     try {
         if (!sistemaVentasAuth || !sistemaVentasDb || !db) {
             return res.status(503).json({ error: 'Sincronización no disponible en el servidor' });
         }
 
-        const { idToken, coleccion, docId, stock } = req.body || {};
+        const { idToken, coleccion, docId, stock, price } = req.body || {};
 
         if (!idToken || typeof idToken !== 'string') {
             return res.status(400).json({ error: 'Falta idToken' });
@@ -684,9 +688,24 @@ app.post('/sincronizar-stock-pos', async (req, res) => {
         if (!docId || typeof docId !== 'string') {
             return res.status(400).json({ error: 'Falta docId' });
         }
-        const stockNum = Number(stock);
-        if (!Number.isFinite(stockNum) || stockNum < 0) {
-            return res.status(400).json({ error: 'Stock inválido' });
+
+        const fields = {};
+        if (stock !== undefined) {
+            const stockNum = Number(stock);
+            if (!Number.isFinite(stockNum) || stockNum < 0) {
+                return res.status(400).json({ error: 'Stock inválido' });
+            }
+            fields.stock = Math.round(stockNum);
+        }
+        if (price !== undefined) {
+            const priceNum = Number(price);
+            if (!Number.isFinite(priceNum) || priceNum < 0) {
+                return res.status(400).json({ error: 'Precio inválido' });
+            }
+            fields.price = Math.round(priceNum * 100) / 100;
+        }
+        if (Object.keys(fields).length === 0) {
+            return res.status(400).json({ error: 'Nada para sincronizar (falta stock o price)' });
         }
 
         let decoded;
@@ -700,11 +719,11 @@ app.post('/sincronizar-stock-pos', async (req, res) => {
         const perfil = perfilSnap.exists ? perfilSnap.data() : null;
 
         if (!perfil || perfil.rol !== 'admin' || perfil.activo === false) {
-            return res.status(403).json({ error: 'Solo un admin de sistema-ventas puede sincronizar stock' });
+            return res.status(403).json({ error: 'Solo un admin de sistema-ventas puede sincronizar' });
         }
 
-        const ok = await firestorePatch(coleccion, docId, { stock: Math.round(stockNum) });
-        if (!ok) return res.status(500).json({ error: 'No se pudo actualizar el stock en Lobo24' });
+        const ok = await firestorePatch(coleccion, docId, fields);
+        if (!ok) return res.status(500).json({ error: 'No se pudo actualizar el producto en Lobo24' });
 
         res.json({ ok: true });
     } catch (err) {
