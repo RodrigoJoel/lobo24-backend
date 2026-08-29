@@ -15,7 +15,12 @@ const ALLOWED_ORIGINS = [
   'https://lobo24-9e46b.firebaseapp.com',
 
   'https://marketlobo24.com.ar',
-  'https://www.marketlobo24.com.ar'
+  'https://www.marketlobo24.com.ar',
+
+  // sistema-ventas (el POS del local, otro proyecto) — solo para llamar a
+  // /sincronizar-stock-pos.
+  'https://sistema-ventas-76350.web.app',
+  'https://sistema-ventas-76350.firebaseapp.com'
 ];
 
 app.use(cors({
@@ -73,6 +78,7 @@ const STORE_WHATSAPP   = '543624235455'; // número con código de país sin +
 // encima de las reglas, como corresponde a un servidor de confianza.
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
+const { getAuth } = require('firebase-admin/auth');
 
 let db = null;
 
@@ -87,6 +93,31 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
     }
 } else {
     console.error('❌ Falta FIREBASE_SERVICE_ACCOUNT_JSON. El servidor no va a poder leer/escribir Firestore.');
+}
+
+// ===================== SISTEMA-VENTAS (segunda conexión, otro proyecto) =====================
+// sistema-ventas es el POS del local — un proyecto de Firebase COMPLETAMENTE
+// distinto a este (lobo24-9e46b). Esta segunda app (con nombre propio,
+// 'sistema-ventas', para no pisar la de arriba) solo se usa para verificar
+// que quien pide subir stock en /sincronizar-stock-pos es realmente un
+// admin logueado en sistema-ventas en ese momento — nunca para nada más.
+// Si falta la credencial, esa ruta específica queda deshabilitada, pero el
+// resto del servidor (pagos, emails) sigue funcionando igual.
+let sistemaVentasAuth = null;
+let sistemaVentasDb = null;
+
+if (process.env.SISTEMA_VENTAS_SERVICE_ACCOUNT_JSON) {
+    try {
+        const svServiceAccount = JSON.parse(process.env.SISTEMA_VENTAS_SERVICE_ACCOUNT_JSON);
+        const svApp = initializeApp({ credential: cert(svServiceAccount) }, 'sistema-ventas');
+        sistemaVentasAuth = getAuth(svApp);
+        sistemaVentasDb = getFirestore(svApp);
+        console.log('✅ Conexión a sistema-ventas inicializada (para verificar admins)');
+    } catch (err) {
+        console.error('❌ SISTEMA_VENTAS_SERVICE_ACCOUNT_JSON inválido:', err.message);
+    }
+} else {
+    console.error('❌ Falta SISTEMA_VENTAS_SERVICE_ACCOUNT_JSON. /sincronizar-stock-pos no va a funcionar (el resto del servidor sigue igual).');
 }
 
 // Obtener doc
@@ -619,6 +650,66 @@ app.post('/crear-preferencia', async (req, res) => {
     } catch (error) {
         console.error('❌ Error MP:', error);
         res.status(500).json({ error: 'Error al crear pago' });
+    }
+});
+
+// ===================== SINCRONIZAR STOCK (subidas desde sistema-ventas) =====================
+// Las bajas de stock por venta ya se manejan directo con las reglas de
+// Firestore de Lobo24 (mismo mecanismo que usa cualquier compra online: un
+// cliente sin login puede bajar stock, nunca subirlo). Esta ruta es SOLO
+// para subidas (entrada de mercadería en el local) — dejar eso abierto a
+// cualquiera permitiría inflar el stock de un producto sin haber comprado
+// nada, por eso acá sí se verifica de verdad que quien llama es un admin
+// logueado en sistema-ventas en este momento (no alcanza con tener una
+// clave copiada de algún lado).
+const COLECCIONES_VALIDAS_LOBO24 = [
+    'bebidas', 'snacks', 'almacen', 'higiene', 'limpieza',
+    'congelados', 'lacteos', 'panaderia', 'mascotas', 'ofertas'
+];
+
+app.post('/sincronizar-stock-pos', async (req, res) => {
+    try {
+        if (!sistemaVentasAuth || !sistemaVentasDb || !db) {
+            return res.status(503).json({ error: 'Sincronización no disponible en el servidor' });
+        }
+
+        const { idToken, coleccion, docId, stock } = req.body || {};
+
+        if (!idToken || typeof idToken !== 'string') {
+            return res.status(400).json({ error: 'Falta idToken' });
+        }
+        if (!COLECCIONES_VALIDAS_LOBO24.includes(coleccion)) {
+            return res.status(400).json({ error: 'Colección inválida' });
+        }
+        if (!docId || typeof docId !== 'string') {
+            return res.status(400).json({ error: 'Falta docId' });
+        }
+        const stockNum = Number(stock);
+        if (!Number.isFinite(stockNum) || stockNum < 0) {
+            return res.status(400).json({ error: 'Stock inválido' });
+        }
+
+        let decoded;
+        try {
+            decoded = await sistemaVentasAuth.verifyIdToken(idToken);
+        } catch (err) {
+            return res.status(401).json({ error: 'Token inválido o vencido' });
+        }
+
+        const perfilSnap = await sistemaVentasDb.collection('usuarios').doc(decoded.uid).get();
+        const perfil = perfilSnap.exists ? perfilSnap.data() : null;
+
+        if (!perfil || perfil.rol !== 'admin' || perfil.activo === false) {
+            return res.status(403).json({ error: 'Solo un admin de sistema-ventas puede sincronizar stock' });
+        }
+
+        const ok = await firestorePatch(coleccion, docId, { stock: Math.round(stockNum) });
+        if (!ok) return res.status(500).json({ error: 'No se pudo actualizar el stock en Lobo24' });
+
+        res.json({ ok: true });
+    } catch (err) {
+        console.error('❌ Error en /sincronizar-stock-pos:', err);
+        res.status(500).json({ error: 'Error interno' });
     }
 });
 
