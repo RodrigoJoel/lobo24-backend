@@ -677,7 +677,7 @@ app.post('/sincronizar-stock-pos', async (req, res) => {
             return res.status(503).json({ error: 'Sincronización no disponible en el servidor' });
         }
 
-        const { idToken, coleccion, docId, stock, price } = req.body || {};
+        const { idToken, coleccion, docId, stock, price, priceEfectivo } = req.body || {};
 
         if (!idToken || typeof idToken !== 'string') {
             return res.status(400).json({ error: 'Falta idToken' });
@@ -704,8 +704,15 @@ app.post('/sincronizar-stock-pos', async (req, res) => {
             }
             fields.price = Math.round(priceNum * 100) / 100;
         }
+        if (priceEfectivo !== undefined) {
+            const priceEfectivoNum = Number(priceEfectivo);
+            if (!Number.isFinite(priceEfectivoNum) || priceEfectivoNum < 0) {
+                return res.status(400).json({ error: 'Precio efectivo inválido' });
+            }
+            fields.priceEfectivo = Math.round(priceEfectivoNum * 100) / 100;
+        }
         if (Object.keys(fields).length === 0) {
-            return res.status(400).json({ error: 'Nada para sincronizar (falta stock o price)' });
+            return res.status(400).json({ error: 'Nada para sincronizar (falta stock, price o priceEfectivo)' });
         }
 
         let decoded;
