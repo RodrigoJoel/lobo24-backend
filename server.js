@@ -689,7 +689,7 @@ app.post('/crear-preferencia', async (req, res) => {
 // clave copiada de algún lado).
 const COLECCIONES_VALIDAS_LOBO24 = [
     'bebidas', 'snacks', 'almacen', 'higiene', 'limpieza',
-    'congelados', 'lacteos', 'panaderia', 'mascotas', 'ofertas'
+    'congelados', 'lacteos', 'panaderia', 'mascotas'
 ];
 
 // Acepta stock y/o price — el nombre de la ruta quedó del alcance
