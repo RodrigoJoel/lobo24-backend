@@ -158,7 +158,8 @@ async function buscarPedidoPorOrderId(orderId) {
 // (los mismos que estaban hardcodeados antes).
 const DEFAULT_SHIPPING = {
     LOCAL_MIN: 85000,
-    COSTO_FIJO: 4500
+    COSTO_FIJO: 4500,
+    MIN_PURCHASE: 10000
 };
 
 let shippingConfigCache = { ...DEFAULT_SHIPPING };
@@ -174,7 +175,8 @@ async function getShippingConfig() {
         if (doc) {
             shippingConfigCache = {
                 LOCAL_MIN: Number(doc.localMin ?? DEFAULT_SHIPPING.LOCAL_MIN),
-                COSTO_FIJO: Number(doc.costoFijo ?? DEFAULT_SHIPPING.COSTO_FIJO)
+                COSTO_FIJO: Number(doc.costoFijo ?? DEFAULT_SHIPPING.COSTO_FIJO),
+                MIN_PURCHASE: Number(doc.minPurchase ?? DEFAULT_SHIPPING.MIN_PURCHASE)
             };
         }
         shippingConfigFetchedAt = Date.now();
@@ -186,6 +188,7 @@ async function getShippingConfig() {
 
 async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId) {
     let subtotal = 0;
+    const validatedItems = [];
 
     for (const item of items) {
         if (!item || !item.coleccion || !item.id) {
@@ -208,10 +211,32 @@ async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId) 
             throw new Error(`Precio inválido para ${item.coleccion}/${item.id}`);
         }
 
+        const limite = producto.maxPorCompra != null ? Number(producto.maxPorCompra) : null;
+        if (limite !== null && qty > limite) {
+            throw new Error(`"${producto.name || item.id}" tiene un límite de ${limite} unidad${limite !== 1 ? 'es' : ''} por pedido`);
+        }
+
         subtotal += precioReal * qty;
+
+        validatedItems.push({
+            docId: item.id,
+            coleccion: item.coleccion,
+            name: producto.name || item.name || '',
+            brand: producto.brand || '',
+            img: producto.img || '',
+            price: precioReal,
+            qty,
+            subtotal: precioReal * qty,
+            stockOriginal: producto.stock != null ? Number(producto.stock) : null
+        });
     }
 
     const SHIPPING = await getShippingConfig();
+
+    if (subtotal < SHIPPING.MIN_PURCHASE) {
+        throw new Error(`El pedido no alcanza el mínimo de compra de $${SHIPPING.MIN_PURCHASE.toLocaleString('es-AR')}`);
+    }
+
     const deliveryCost = delivery === 'local'
         ? 0
         : (subtotal >= SHIPPING.LOCAL_MIN ? 0 : SHIPPING.COSTO_FIJO);
@@ -230,14 +255,14 @@ async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId) 
 
     const total = Math.max(0, subtotal + deliveryCost - pointsUsed);
 
-    return { subtotal, deliveryCost, pointsUsed, total };
+    return { subtotal, deliveryCost, pointsUsed, total, items: validatedItems };
 }
 
-// ===================== DESCUENTO DE STOCK (pedidos pagados con Mercado Pago) =====================
-// checkout.js ya descuenta el stock en el momento para transferencia/
-// efectivo (el cliente confirma en persona). Para Mercado Pago, el stock
-// recién se descuenta acá, cuando el webhook confirma el pago — nunca
-// antes, para no restar stock de pedidos que el cliente nunca terminó de pagar.
+// ===================== DESCUENTO DE STOCK =====================
+// Para Mercado Pago, el stock se descuenta acá cuando el webhook confirma
+// el pago — nunca antes, para no restar stock de pedidos que el cliente
+// nunca terminó de pagar. Para transferencia/efectivo (que se confirman
+// en persona) se descuenta al momento, desde /confirmar-pedido-manual.
 async function descontarStockPedido(pedido) {
     const items = pedido.items || [];
 
@@ -756,6 +781,87 @@ app.post('/enviar-email-pedido', async (req, res) => {
     } catch (err) {
         console.error('❌ Error en /enviar-email-pedido:', err);
         res.status(500).json({ error: 'Error al enviar email' });
+    }
+});
+
+// ===================== CONFIRMAR PEDIDO MANUAL (transferencia / efectivo) =====================
+// A diferencia de Mercado Pago, estos pedidos no pasan por ningún pago
+// online que valide el monto — antes se guardaban directo desde el
+// navegador, confiando en lo que mandara el cliente (precio, mínimo de
+// compra, límites por producto, todo manipulable desde las herramientas
+// de desarrollador). Acá se recalcula todo contra Firestore con
+// calcularTotalReal() antes de guardar nada, igual que en /crear-preferencia.
+app.post('/confirmar-pedido-manual', async (req, res) => {
+    try {
+        const { orderId, items, contact, delivery, payment, pointsUsed, userId } = req.body || {};
+
+        if (!orderId || typeof orderId !== 'string') {
+            return res.status(400).json({ error: 'Falta orderId' });
+        }
+        if (payment !== 'transfer' && payment !== 'efectivo') {
+            return res.status(400).json({ error: 'Método de pago inválido para esta ruta' });
+        }
+        if (payment === 'efectivo' && delivery !== 'local') {
+            return res.status(400).json({ error: 'Efectivo solo está disponible con retiro en sucursal' });
+        }
+        if (!items || !Array.isArray(items) || items.length === 0) {
+            return res.status(400).json({ error: 'No hay productos' });
+        }
+        if (!contact || typeof contact !== 'object') {
+            return res.status(400).json({ error: 'Faltan datos de contacto' });
+        }
+
+        let resultado;
+        try {
+            resultado = await calcularTotalReal(items, delivery, pointsUsed, userId);
+        } catch (validationError) {
+            console.error('❌ No se pudo validar el pedido (manual):', validationError.message);
+            return res.status(400).json({ error: validationError.message });
+        }
+
+        const { subtotal, deliveryCost, pointsUsed: pointsUsedFinal, total, items: validatedItems } = resultado;
+        const pointsEarned = Math.floor(subtotal / 100);
+
+        const pedidoData = {
+            orderId,
+            userId: userId || null,
+            contact,
+            items: validatedItems,
+            subtotal,
+            delivery,
+            deliveryCost,
+            pointsUsed: pointsUsedFinal,
+            pointsEarned,
+            payment,
+            total,
+            status: 'confirmed',
+            createdAt: new Date()
+        };
+
+        await db.collection('pedidos').add(pedidoData);
+        await descontarStockPedido({ items: validatedItems });
+
+        if (userId) {
+            try {
+                const userRef = db.collection('users').doc(userId);
+                await db.runTransaction(async (tx) => {
+                    const snap = await tx.get(userRef);
+                    if (!snap.exists) return;
+                    const currentPoints = Number(snap.data().points || 0);
+                    const newPoints = Math.max(0, currentPoints - pointsUsedFinal + pointsEarned);
+                    tx.update(userRef, { points: newPoints });
+                });
+            } catch (err) {
+                console.error('❌ Error actualizando puntos del usuario:', err.message);
+            }
+        }
+
+        await enviarEmailsPedido(pedidoData);
+
+        res.json({ ok: true, orderId, subtotal, deliveryCost, pointsUsed: pointsUsedFinal, pointsEarned, total });
+    } catch (err) {
+        console.error('❌ Error en /confirmar-pedido-manual:', err);
+        res.status(500).json({ error: 'Error interno al confirmar el pedido' });
     }
 });
 
