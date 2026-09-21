@@ -188,53 +188,98 @@ async function getShippingConfig() {
     return shippingConfigCache;
 }
 
-// ===================== DISTANCIA DE ENVÍO (Google Geocoding) =====================
-// El radio de entrega se valida acá, en el servidor, con la API key en
-// GOOGLE_MAPS_API_KEY (nunca expuesta al navegador). Distancia en línea
-// recta entre el local y la dirección geocodificada del cliente.
-const STORE_ADDRESS = 'Sarmiento 322, Resistencia, Chaco, Argentina';
-let storeCoordsCache = null;
+// ===================== DISTANCIA DE ENVÍO (OpenStreetMap / Nominatim) =====================
+// El radio de entrega se valida acá, en el servidor. Se geocodifica la
+// dirección con Nominatim (gratis, sin clave) y se mide la distancia en
+// línea recta contra el local.
+//
+// OSM no tiene todos los números de calle de Resistencia. Si la dirección
+// exacta no está, se ubica la calle: se bloquea solo si NINGÚN tramo de esa
+// calle cae dentro del radio; si puede estar dentro, el pedido pasa marcado
+// como distancia aproximada (distanceApprox) para verificarlo a mano.
+const NOMINATIM_URL = 'https://nominatim.openstreetmap.org/search';
+const NOMINATIM_UA = 'Lobo24-checkout/1.0 (rodrigoatatat@gmail.com)';
+const DEFAULT_STORE_COORDS = { lat: -27.4487, lng: -58.9836 }; // Sarmiento 322, Resistencia
+const GEOCODE_CACHE_TTL_MS = 60 * 60 * 1000;
+const geocodeCache = new Map();
+let nominatimQueue = Promise.resolve();
 
-async function geocodificar(direccion) {
-    const key = process.env.GOOGLE_MAPS_API_KEY;
-    if (!key) throw new Error('Validación de distancia no configurada (falta GOOGLE_MAPS_API_KEY)');
+// Nominatim permite 1 consulta por segundo: se encolan y se espacian.
+function nominatimGet(params) {
+    const run = async () => {
+        const url = NOMINATIM_URL + '?' + new URLSearchParams({ format: 'jsonv2', limit: '10', ...params });
+        const resp = await fetch(url, {
+            headers: { 'User-Agent': NOMINATIM_UA, 'Accept-Language': 'es' },
+            signal: AbortSignal.timeout(8000)
+        });
+        if (!resp.ok) throw new Error(`Nominatim HTTP ${resp.status}`);
+        return resp.json();
+    };
+    const result = nominatimQueue.then(run, run);
+    nominatimQueue = result.then(() => new Promise(r => setTimeout(r, 1100)), () => new Promise(r => setTimeout(r, 1100)));
+    return result;
+}
 
-    const url = 'https://maps.googleapis.com/maps/api/geocode/json?' + new URLSearchParams({
-        address: direccion,
-        components: 'country:AR',
-        region: 'ar',
-        language: 'es',
-        key
-    });
-    const resp = await fetch(url);
-    const data = await resp.json();
+function normalizarCalle(street) {
+    let s = String(street).trim().replace(/\s+/g, ' ');
+    s = s.replace(/^(av|avda|avd)\.?\s+/i, 'Avenida ').replace(/^(bv|bvd|blvd)\.?\s+/i, 'Boulevard ');
+    const m = s.match(/^(.*?)[\s,]+(\d{1,5})$/);
+    return m ? { name: m[1].trim(), number: m[2] } : { name: s, number: null };
+}
 
-    if (data.status === 'ZERO_RESULTS') return null;
-    if (data.status !== 'OK') {
-        console.error('❌ Geocoding falló:', data.status, data.error_message || '');
+// Devuelve { exact: {lat,lng} | null, roads: [{lat,lng}] } o null si no hay nada utilizable.
+async function geocodificar(street, city, province) {
+    const key = `${street}|${city}|${province}`.toLowerCase();
+    const hit = geocodeCache.get(key);
+    if (hit && Date.now() - hit.ts < GEOCODE_CACHE_TTL_MS) return hit.val;
+
+    const { name, number } = normalizarCalle(street);
+    let results;
+    try {
+        results = await nominatimGet({
+            street: number ? `${number} ${name}` : name,
+            city, state: province || 'Chaco', country: 'Argentina'
+        });
+        if (!results.length) {
+            results = await nominatimGet({ q: `${street}, ${city}, ${province || 'Chaco'}, Argentina` });
+        }
+    } catch (err) {
+        console.error('❌ Geocoding falló:', err.message);
         throw new Error('No se pudo validar la dirección en este momento. Intentá de nuevo o elegí retiro en sucursal.');
     }
-    const r = data.results[0];
-    return {
-        lat: r.geometry.location.lat,
-        lng: r.geometry.location.lng,
-        locationType: r.geometry.location_type,
-        partial: !!r.partial_match
-    };
+
+    const enChaco = results.filter(r => /chaco/i.test(r.display_name || ''));
+    const toPt = (r) => ({ lat: Number(r.lat), lng: Number(r.lon) });
+    const house = number ? enChaco.find(r => r.place_rank >= 28 && ['house', 'residential', 'apartments', 'yes', 'detached'].includes(r.type)) : null;
+    const roads = enChaco.filter(r => r.category === 'highway').map(toPt);
+
+    let val = house ? { exact: toPt(house), roads: [] }
+        : roads.length ? { exact: null, roads }
+        : null;
+
+    // OSM no tiene esa numeración: se reintenta solo con la calle.
+    if (!val && number) {
+        let calle = [];
+        try {
+            calle = await nominatimGet({ street: name, city, state: province || 'Chaco', country: 'Argentina' });
+        } catch (err) {
+            console.error('❌ Geocoding falló:', err.message);
+            throw new Error('No se pudo validar la dirección en este momento. Intentá de nuevo o elegí retiro en sucursal.');
+        }
+        const soloCalle = calle.filter(r => /chaco/i.test(r.display_name || '') && r.category === 'highway').map(toPt);
+        if (soloCalle.length) val = { exact: null, roads: soloCalle };
+    }
+    geocodeCache.set(key, { ts: Date.now(), val });
+    return val;
 }
 
 async function getStoreCoords() {
-    if (storeCoordsCache) return storeCoordsCache;
     const envLat = Number(process.env.STORE_LAT);
     const envLng = Number(process.env.STORE_LNG);
-    if (Number.isFinite(envLat) && Number.isFinite(envLng) && process.env.STORE_LAT && process.env.STORE_LNG) {
-        storeCoordsCache = { lat: envLat, lng: envLng };
-        return storeCoordsCache;
+    if (process.env.STORE_LAT && process.env.STORE_LNG && Number.isFinite(envLat) && Number.isFinite(envLng)) {
+        return { lat: envLat, lng: envLng };
     }
-    const g = await geocodificar(STORE_ADDRESS);
-    if (!g) throw new Error('No se pudo ubicar el local para calcular la distancia');
-    storeCoordsCache = { lat: g.lat, lng: g.lng };
-    return storeCoordsCache;
+    return DEFAULT_STORE_COORDS;
 }
 
 function haversineKm(a, b) {
@@ -246,8 +291,8 @@ function haversineKm(a, b) {
     return 2 * 6371 * Math.asin(Math.sqrt(h));
 }
 
-// Devuelve { distanceKm, maxKm }; lanza Error con mensaje para el cliente
-// si la dirección no se puede ubicar con precisión o queda fuera del radio.
+// Devuelve { distanceKm, maxKm, approx }; lanza Error con mensaje para el
+// cliente si no se puede ubicar la dirección o queda fuera del radio.
 async function validarDistanciaEnvio(direccion) {
     const { street, city, province } = direccion || {};
     if (!street || !city) {
@@ -255,19 +300,21 @@ async function validarDistanciaEnvio(direccion) {
     }
 
     const { RADIO_KM } = await getShippingConfig();
-    const g = await geocodificar(`${street}, ${city}, ${province || 'Chaco'}, Argentina`);
+    const g = await geocodificar(street, city, province);
 
-    if (!g || g.locationType === 'APPROXIMATE' || g.partial) {
-        throw new Error('No pudimos ubicar tu dirección con precisión. Revisá calle, número y localidad, o elegí retiro en sucursal.');
+    if (!g) {
+        throw new Error('No pudimos ubicar tu dirección. Revisá calle, número y localidad, o elegí retiro en sucursal.');
     }
 
     const store = await getStoreCoords();
-    const distanceKm = Math.round(haversineKm(store, g) * 10) / 10;
+    const approx = !g.exact;
+    const distancias = (g.exact ? [g.exact] : g.roads).map(p => haversineKm(store, p));
+    const distanceKm = Math.round(Math.min(...distancias) * 10) / 10;
 
     if (distanceKm > RADIO_KM) {
         throw new Error(`Tu dirección está a ${distanceKm} km del local y hacemos envíos hasta ${RADIO_KM} km. Podés elegir retiro en sucursal.`);
     }
-    return { distanceKm, maxKm: RADIO_KM };
+    return { distanceKm, maxKm: RADIO_KM, approx };
 }
 
 async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId, direccion) {
@@ -326,8 +373,9 @@ async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId, 
         : (subtotal >= SHIPPING.LOCAL_MIN ? 0 : SHIPPING.COSTO_FIJO);
 
     let distanceKm = null;
+    let distanceApprox = false;
     if (delivery !== 'local') {
-        ({ distanceKm } = await validarDistanciaEnvio(direccion));
+        ({ distanceKm, approx: distanceApprox } = await validarDistanciaEnvio(direccion));
     }
 
     let pointsUsed = 0;
@@ -344,7 +392,7 @@ async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId, 
 
     const total = Math.max(0, subtotal + deliveryCost - pointsUsed);
 
-    return { subtotal, deliveryCost, pointsUsed, total, distanceKm, items: validatedItems };
+    return { subtotal, deliveryCost, pointsUsed, total, distanceKm, distanceApprox, items: validatedItems };
 }
 
 // ===================== DESCUENTO DE STOCK =====================
@@ -689,10 +737,10 @@ app.post('/crear-preferencia', async (req, res) => {
 
         console.log('📦 BODY RECIBIDO:', JSON.stringify(req.body, null, 2));
 
-        let totalFinal, subtotal, deliveryCost, pointsUsed, distanceKm;
+        let totalFinal, subtotal, deliveryCost, pointsUsed, distanceKm, distanceApprox;
 
         try {
-            ({ total: totalFinal, subtotal, deliveryCost, pointsUsed, distanceKm } = await calcularTotalReal(
+            ({ total: totalFinal, subtotal, deliveryCost, pointsUsed, distanceKm, distanceApprox } = await calcularTotalReal(
                 items,
                 orderData?.delivery,
                 orderData?.pointsUsed,
@@ -725,6 +773,7 @@ app.post('/crear-preferencia', async (req, res) => {
                     deliveryCost,
                     pointsUsed,
                     distanceKm,
+                    distanceApprox,
                     total: totalFinal
                 });
             }
@@ -924,7 +973,7 @@ app.post('/confirmar-pedido-manual', async (req, res) => {
             return res.status(400).json({ error: validationError.message });
         }
 
-        const { subtotal, deliveryCost, pointsUsed: pointsUsedFinal, total, distanceKm, items: validatedItems } = resultado;
+        const { subtotal, deliveryCost, pointsUsed: pointsUsedFinal, total, distanceKm, distanceApprox, items: validatedItems } = resultado;
         const pointsEarned = Math.floor(subtotal / 100);
 
         const pedidoData = {
@@ -936,6 +985,7 @@ app.post('/confirmar-pedido-manual', async (req, res) => {
             delivery,
             deliveryCost,
             distanceKm,
+            distanceApprox,
             pointsUsed: pointsUsedFinal,
             pointsEarned,
             payment,
