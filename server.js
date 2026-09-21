@@ -159,7 +159,8 @@ async function buscarPedidoPorOrderId(orderId) {
 const DEFAULT_SHIPPING = {
     LOCAL_MIN: 85000,
     COSTO_FIJO: 4500,
-    MIN_PURCHASE: 10000
+    MIN_PURCHASE: 10000,
+    RADIO_KM: 3
 };
 
 let shippingConfigCache = { ...DEFAULT_SHIPPING };
@@ -176,7 +177,8 @@ async function getShippingConfig() {
             shippingConfigCache = {
                 LOCAL_MIN: Number(doc.localMin ?? DEFAULT_SHIPPING.LOCAL_MIN),
                 COSTO_FIJO: Number(doc.costoFijo ?? DEFAULT_SHIPPING.COSTO_FIJO),
-                MIN_PURCHASE: Number(doc.minPurchase ?? DEFAULT_SHIPPING.MIN_PURCHASE)
+                MIN_PURCHASE: Number(doc.minPurchase ?? DEFAULT_SHIPPING.MIN_PURCHASE),
+                RADIO_KM: Number(doc.radioKm ?? DEFAULT_SHIPPING.RADIO_KM)
             };
         }
         shippingConfigFetchedAt = Date.now();
@@ -186,7 +188,89 @@ async function getShippingConfig() {
     return shippingConfigCache;
 }
 
-async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId) {
+// ===================== DISTANCIA DE ENVÍO (Google Geocoding) =====================
+// El radio de entrega se valida acá, en el servidor, con la API key en
+// GOOGLE_MAPS_API_KEY (nunca expuesta al navegador). Distancia en línea
+// recta entre el local y la dirección geocodificada del cliente.
+const STORE_ADDRESS = 'Sarmiento 322, Resistencia, Chaco, Argentina';
+let storeCoordsCache = null;
+
+async function geocodificar(direccion) {
+    const key = process.env.GOOGLE_MAPS_API_KEY;
+    if (!key) throw new Error('Validación de distancia no configurada (falta GOOGLE_MAPS_API_KEY)');
+
+    const url = 'https://maps.googleapis.com/maps/api/geocode/json?' + new URLSearchParams({
+        address: direccion,
+        components: 'country:AR',
+        region: 'ar',
+        language: 'es',
+        key
+    });
+    const resp = await fetch(url);
+    const data = await resp.json();
+
+    if (data.status === 'ZERO_RESULTS') return null;
+    if (data.status !== 'OK') {
+        console.error('❌ Geocoding falló:', data.status, data.error_message || '');
+        throw new Error('No se pudo validar la dirección en este momento. Intentá de nuevo o elegí retiro en sucursal.');
+    }
+    const r = data.results[0];
+    return {
+        lat: r.geometry.location.lat,
+        lng: r.geometry.location.lng,
+        locationType: r.geometry.location_type,
+        partial: !!r.partial_match
+    };
+}
+
+async function getStoreCoords() {
+    if (storeCoordsCache) return storeCoordsCache;
+    const envLat = Number(process.env.STORE_LAT);
+    const envLng = Number(process.env.STORE_LNG);
+    if (Number.isFinite(envLat) && Number.isFinite(envLng) && process.env.STORE_LAT && process.env.STORE_LNG) {
+        storeCoordsCache = { lat: envLat, lng: envLng };
+        return storeCoordsCache;
+    }
+    const g = await geocodificar(STORE_ADDRESS);
+    if (!g) throw new Error('No se pudo ubicar el local para calcular la distancia');
+    storeCoordsCache = { lat: g.lat, lng: g.lng };
+    return storeCoordsCache;
+}
+
+function haversineKm(a, b) {
+    const rad = (d) => d * Math.PI / 180;
+    const dLat = rad(b.lat - a.lat);
+    const dLng = rad(b.lng - a.lng);
+    const h = Math.sin(dLat / 2) ** 2 +
+        Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2;
+    return 2 * 6371 * Math.asin(Math.sqrt(h));
+}
+
+// Devuelve { distanceKm, maxKm }; lanza Error con mensaje para el cliente
+// si la dirección no se puede ubicar con precisión o queda fuera del radio.
+async function validarDistanciaEnvio(direccion) {
+    const { street, city, province } = direccion || {};
+    if (!street || !city) {
+        throw new Error('Falta la dirección de entrega para validar la distancia');
+    }
+
+    const { RADIO_KM } = await getShippingConfig();
+    const g = await geocodificar(`${street}, ${city}, ${province || 'Chaco'}, Argentina`);
+
+    if (!g || g.locationType === 'APPROXIMATE' || g.partial) {
+        throw new Error('No pudimos ubicar tu dirección con precisión. Revisá calle, número y localidad, o elegí retiro en sucursal.');
+    }
+
+    const store = await getStoreCoords();
+    const distanceKm = Math.round(haversineKm(store, g) * 10) / 10;
+
+    if (distanceKm > RADIO_KM) {
+        throw new Error(`Tu dirección está a ${distanceKm} km del local y hacemos envíos hasta ${RADIO_KM} km. Podés elegir retiro en sucursal.`);
+    }
+    return { distanceKm, maxKm: RADIO_KM };
+}
+
+async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId, direccion) {
     let subtotal = 0;
     const validatedItems = [];
 
@@ -241,6 +325,11 @@ async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId) 
         ? 0
         : (subtotal >= SHIPPING.LOCAL_MIN ? 0 : SHIPPING.COSTO_FIJO);
 
+    let distanceKm = null;
+    if (delivery !== 'local') {
+        ({ distanceKm } = await validarDistanciaEnvio(direccion));
+    }
+
     let pointsUsed = 0;
     const pointsSolicitados = Number(pointsUsedSolicitado || 0);
 
@@ -255,7 +344,7 @@ async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId) 
 
     const total = Math.max(0, subtotal + deliveryCost - pointsUsed);
 
-    return { subtotal, deliveryCost, pointsUsed, total, items: validatedItems };
+    return { subtotal, deliveryCost, pointsUsed, total, distanceKm, items: validatedItems };
 }
 
 // ===================== DESCUENTO DE STOCK =====================
@@ -575,6 +664,19 @@ app.get('/', (req, res) => {
     res.json({ status: 'ok', message: 'Servidor Lobo24 funcionando!' });
 });
 
+// ===================== VALIDAR DISTANCIA (checkout, paso 3) =====================
+// Aviso temprano al cliente. La validación que cuenta es la que corre
+// dentro de calcularTotalReal() al confirmar el pedido.
+app.post('/validar-distancia', async (req, res) => {
+    try {
+        const { street, city, province } = req.body || {};
+        const resultado = await validarDistanciaEnvio({ street, city, province });
+        res.json({ ok: true, ...resultado });
+    } catch (err) {
+        res.status(400).json({ ok: false, error: err.message });
+    }
+});
+
 // ===================== CREAR PREFERENCIA =====================
 
 app.post('/crear-preferencia', async (req, res) => {
@@ -587,14 +689,15 @@ app.post('/crear-preferencia', async (req, res) => {
 
         console.log('📦 BODY RECIBIDO:', JSON.stringify(req.body, null, 2));
 
-        let totalFinal, subtotal, deliveryCost, pointsUsed;
+        let totalFinal, subtotal, deliveryCost, pointsUsed, distanceKm;
 
         try {
-            ({ total: totalFinal, subtotal, deliveryCost, pointsUsed } = await calcularTotalReal(
+            ({ total: totalFinal, subtotal, deliveryCost, pointsUsed, distanceKm } = await calcularTotalReal(
                 items,
                 orderData?.delivery,
                 orderData?.pointsUsed,
-                orderData?.userId
+                orderData?.userId,
+                orderData?.address
             ));
         } catch (validationError) {
             console.error('❌ No se pudo validar el pedido contra Firestore:', validationError.message);
@@ -621,6 +724,7 @@ app.post('/crear-preferencia', async (req, res) => {
                     subtotal,
                     deliveryCost,
                     pointsUsed,
+                    distanceKm,
                     total: totalFinal
                 });
             }
@@ -689,7 +793,8 @@ app.post('/crear-preferencia', async (req, res) => {
 // clave copiada de algún lado).
 const COLECCIONES_VALIDAS_LOBO24 = [
     'bebidas', 'snacks', 'almacen', 'higiene', 'limpieza',
-    'congelados', 'lacteos', 'panaderia', 'mascotas'
+    'congelados', 'lacteos', 'panaderia', 'mascotas',
+    'perfumeria', 'bazar'
 ];
 
 // Acepta stock y/o price — el nombre de la ruta quedó del alcance
@@ -813,13 +918,13 @@ app.post('/confirmar-pedido-manual', async (req, res) => {
 
         let resultado;
         try {
-            resultado = await calcularTotalReal(items, delivery, pointsUsed, userId);
+            resultado = await calcularTotalReal(items, delivery, pointsUsed, userId, contact);
         } catch (validationError) {
             console.error('❌ No se pudo validar el pedido (manual):', validationError.message);
             return res.status(400).json({ error: validationError.message });
         }
 
-        const { subtotal, deliveryCost, pointsUsed: pointsUsedFinal, total, items: validatedItems } = resultado;
+        const { subtotal, deliveryCost, pointsUsed: pointsUsedFinal, total, distanceKm, items: validatedItems } = resultado;
         const pointsEarned = Math.floor(subtotal / 100);
 
         const pedidoData = {
@@ -830,6 +935,7 @@ app.post('/confirmar-pedido-manual', async (req, res) => {
             subtotal,
             delivery,
             deliveryCost,
+            distanceKm,
             pointsUsed: pointsUsedFinal,
             pointsEarned,
             payment,
