@@ -13,4 +13,4 @@ jobs:
         run: |
           curl -sS -f \
             -A "Mozilla/5.0 (compatible; Lobo24KeepAlive/1.0)" \
-            https://lobo24-backend.onrender.com/
+            https://lobo24-backend-zibj.onrender.com/
