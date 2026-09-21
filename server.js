@@ -188,36 +188,45 @@ async function getShippingConfig() {
     return shippingConfigCache;
 }
 
-// ===================== DISTANCIA DE ENVÍO (OpenStreetMap / Nominatim) =====================
+// ===================== DISTANCIA DE ENVÍO (OpenStreetMap: Photon / Nominatim) =====================
 // El radio de entrega se valida acá, en el servidor. Se geocodifica la
-// dirección con Nominatim (gratis, sin clave) y se mide la distancia en
-// línea recta contra el local.
+// dirección con Photon (gratis, sin clave; respaldo: Nominatim, que
+// rechaza con 429 a muchos servidores compartidos) y se mide la distancia
+// en línea recta contra el local.
 //
 // OSM no tiene todos los números de calle de Resistencia. Si la dirección
 // exacta no está, se ubica la calle: se bloquea solo si NINGÚN tramo de esa
 // calle cae dentro del radio; si puede estar dentro, el pedido pasa marcado
 // como distancia aproximada (distanceApprox) para verificarlo a mano.
-const NOMINATIM_URL = 'https://nominatim.openstreetmap.org/search';
-const NOMINATIM_UA = 'Lobo24-checkout/1.0 (rodrigoatatat@gmail.com)';
+const GEO_UA = 'Lobo24-checkout/1.0 (rodrigoatatat@gmail.com)';
 const DEFAULT_STORE_COORDS = { lat: -27.4487, lng: -58.9836 }; // Sarmiento 322, Resistencia
 const GEOCODE_CACHE_TTL_MS = 60 * 60 * 1000;
 const geocodeCache = new Map();
 let nominatimQueue = Promise.resolve();
 
+async function geoGet(baseUrl, params, extraHeaders = {}) {
+    const resp = await fetch(baseUrl + '?' + new URLSearchParams(params), {
+        headers: { 'User-Agent': GEO_UA, 'Accept-Language': 'es', ...extraHeaders },
+        signal: AbortSignal.timeout(8000)
+    });
+    if (!resp.ok) throw new Error(`${new URL(baseUrl).hostname} HTTP ${resp.status}`);
+    return resp.json();
+}
+
 // Nominatim permite 1 consulta por segundo: se encolan y se espacian.
 function nominatimGet(params) {
-    const run = async () => {
-        const url = NOMINATIM_URL + '?' + new URLSearchParams({ format: 'jsonv2', limit: '10', ...params });
-        const resp = await fetch(url, {
-            headers: { 'User-Agent': NOMINATIM_UA, 'Accept-Language': 'es' },
-            signal: AbortSignal.timeout(8000)
-        });
-        if (!resp.ok) throw new Error(`Nominatim HTTP ${resp.status}`);
-        return resp.json();
-    };
+    const run = () => geoGet('https://nominatim.openstreetmap.org/search', { format: 'jsonv2', limit: '10', ...params });
     const result = nominatimQueue.then(run, run);
-    nominatimQueue = result.then(() => new Promise(r => setTimeout(r, 1100)), () => new Promise(r => setTimeout(r, 1100)));
+    const pausa = () => new Promise(r => setTimeout(r, 1100));
+    nominatimQueue = result.then(pausa, pausa);
     return result;
+}
+
+function photonGet(q) {
+    return geoGet('https://photon.komoot.io/api/', {
+        q, limit: '10',
+        lat: String(DEFAULT_STORE_COORDS.lat), lon: String(DEFAULT_STORE_COORDS.lng)
+    });
 }
 
 function normalizarCalle(street) {
@@ -227,6 +236,48 @@ function normalizarCalle(street) {
     return m ? { name: m[1].trim(), number: m[2] } : { name: s, number: null };
 }
 
+const PALABRAS_GENERICAS = new Set(['avenida', 'av', 'calle', 'pasaje', 'psje', 'boulevard', 'bv', 'ruta', 'camino', 'de', 'del', 'la', 'las', 'los', 'el']);
+const sinAcentos = (t) => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+
+// El buscador puede devolver calles parecidas pero distintas ("Calle
+// Inventada" -> "Calle 1"): se exige que compartan la parte distintiva del nombre.
+function nombreCoincide(pedido, encontrado) {
+    const claves = sinAcentos(pedido).split(/[^a-z0-9]+/).filter(t => t && !PALABRAS_GENERICAS.has(t));
+    if (!claves.length) return false;
+    const hallado = sinAcentos(encontrado);
+    return claves.every(t => hallado.includes(t));
+}
+
+async function buscarConPhoton(name, number, city, province) {
+    const prov = province || 'Chaco';
+    const filtrar = (data) => (data.features || []).filter(f => /chaco/i.test(f.properties?.state || ''));
+    const pt = (f) => ({ lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0] });
+    const calles = (fs) => fs.filter(f => f.properties.osm_key === 'highway' && f.properties.type === 'street' && nombreCoincide(name, f.properties.name)).map(pt);
+
+    if (number) {
+        const fs = filtrar(await photonGet(`${number} ${name}, ${city}, ${prov}, Argentina`));
+        const house = fs.find(f => f.properties.osm_value === 'house_number' && String(f.properties.housenumber) === number);
+        if (house) return { exact: pt(house), roads: [] };
+    }
+    const roads = calles(filtrar(await photonGet(`${name}, ${city}, ${prov}, Argentina`)));
+    return roads.length ? { exact: null, roads } : null;
+}
+
+async function buscarConNominatim(name, number, city, province) {
+    const prov = province || 'Chaco';
+    const enChaco = (rs) => rs.filter(r => /chaco/i.test(r.display_name || ''));
+    const toPt = (r) => ({ lat: Number(r.lat), lng: Number(r.lon) });
+
+    if (number) {
+        const rs = enChaco(await nominatimGet({ street: `${number} ${name}`, city, state: prov, country: 'Argentina' }));
+        const house = rs.find(r => r.place_rank >= 28 && ['house', 'residential', 'apartments', 'yes', 'detached'].includes(r.type));
+        if (house) return { exact: toPt(house), roads: [] };
+    }
+    const roads = enChaco(await nominatimGet({ street: name, city, state: prov, country: 'Argentina' }))
+        .filter(r => r.category === 'highway' && nombreCoincide(name, r.name)).map(toPt);
+    return roads.length ? { exact: null, roads } : null;
+}
+
 // Devuelve { exact: {lat,lng} | null, roads: [{lat,lng}] } o null si no hay nada utilizable.
 async function geocodificar(street, city, province) {
     const key = `${street}|${city}|${province}`.toLowerCase();
@@ -234,40 +285,17 @@ async function geocodificar(street, city, province) {
     if (hit && Date.now() - hit.ts < GEOCODE_CACHE_TTL_MS) return hit.val;
 
     const { name, number } = normalizarCalle(street);
-    let results;
+    let val;
     try {
-        results = await nominatimGet({
-            street: number ? `${number} ${name}` : name,
-            city, state: province || 'Chaco', country: 'Argentina'
-        });
-        if (!results.length) {
-            results = await nominatimGet({ q: `${street}, ${city}, ${province || 'Chaco'}, Argentina` });
-        }
+        val = await buscarConPhoton(name, number, city, province);
     } catch (err) {
-        console.error('❌ Geocoding falló:', err.message);
-        throw new Error('No se pudo validar la dirección en este momento. Intentá de nuevo o elegí retiro en sucursal.');
-    }
-
-    const enChaco = results.filter(r => /chaco/i.test(r.display_name || ''));
-    const toPt = (r) => ({ lat: Number(r.lat), lng: Number(r.lon) });
-    const house = number ? enChaco.find(r => r.place_rank >= 28 && ['house', 'residential', 'apartments', 'yes', 'detached'].includes(r.type)) : null;
-    const roads = enChaco.filter(r => r.category === 'highway').map(toPt);
-
-    let val = house ? { exact: toPt(house), roads: [] }
-        : roads.length ? { exact: null, roads }
-        : null;
-
-    // OSM no tiene esa numeración: se reintenta solo con la calle.
-    if (!val && number) {
-        let calle = [];
+        console.error('⚠️ Photon falló, se prueba Nominatim:', err.message);
         try {
-            calle = await nominatimGet({ street: name, city, state: province || 'Chaco', country: 'Argentina' });
-        } catch (err) {
-            console.error('❌ Geocoding falló:', err.message);
+            val = await buscarConNominatim(name, number, city, province);
+        } catch (err2) {
+            console.error('❌ Geocoding falló:', err2.message);
             throw new Error('No se pudo validar la dirección en este momento. Intentá de nuevo o elegí retiro en sucursal.');
         }
-        const soloCalle = calle.filter(r => /chaco/i.test(r.display_name || '') && r.category === 'highway').map(toPt);
-        if (soloCalle.length) val = { exact: null, roads: soloCalle };
     }
     geocodeCache.set(key, { ts: Date.now(), val });
     return val;
