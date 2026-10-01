@@ -1,5 +1,6 @@
 const express = require('express');
 const cors    = require('cors');
+const crypto  = require('crypto');
 require('dotenv').config();
 
 const app  = express();
@@ -81,12 +82,14 @@ const { getFirestore } = require('firebase-admin/firestore');
 const { getAuth } = require('firebase-admin/auth');
 
 let db = null;
+let lobo24Auth = null;
 
 if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
     try {
         const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
         const firebaseApp = initializeApp({ credential: cert(serviceAccount) });
         db = getFirestore(firebaseApp);
+        lobo24Auth = getAuth(firebaseApp);
         console.log('✅ Firebase Admin SDK inicializado');
     } catch (err) {
         console.error('❌ FIREBASE_SERVICE_ACCOUNT_JSON inválido:', err.message);
@@ -144,6 +147,47 @@ async function buscarPedidoPorOrderId(orderId) {
 
     const doc = snap.docs[0];
     return { docId: doc.id, ...doc.data() };
+}
+
+// ===================== IDENTIDAD DEL CLIENTE =====================
+// El navegador manda el token de sesión de Firebase en el header
+// Authorization. El uid sale de ese token, que firma Google, y no de un
+// userId escrito en el cuerpo del pedido: ese se puede cambiar desde las
+// herramientas de desarrollador para usar los puntos de otra cuenta, o
+// para recibir el descuento sin que se le descuenten a nadie.
+//
+// Devuelve null si la compra es como invitado. Si el pedido no se puede
+// atribuir de forma confiable, lanza un error con .status (401 o 409).
+async function obtenerUidVerificado(req, userIdDelCuerpo) {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+
+    if (!token) {
+        // Un userId sin token solo lo manda una versión anterior de la
+        // página que quedó abierta o en caché.
+        if (userIdDelCuerpo) {
+            const err = new Error('La página se actualizó. Recargala (Ctrl + F5) y volvé a confirmar el pedido.');
+            err.status = 409;
+            throw err;
+        }
+        return null;
+    }
+
+    try {
+        const decoded = await lobo24Auth.verifyIdToken(token);
+        return decoded.uid;
+    } catch (e) {
+        const err = new Error('Tu sesión venció. Iniciá sesión de nuevo para confirmar el pedido.');
+        err.status = 401;
+        throw err;
+    }
+}
+
+// El número de pedido lo genera el servidor, con el mismo formato que
+// usaba el navegador. Si lo eligiera el cliente, podría repetir el de otro
+// pedido y el webhook no sabría cuál de los dos confirmar.
+function generarOrderId() {
+    return 'LB' + Date.now().toString(36).toUpperCase() + crypto.randomBytes(2).toString('hex').toUpperCase();
 }
 
 // ===================== VALIDACIÓN DE PRECIOS (ANTI-TAMPERING) =====================
@@ -480,6 +524,25 @@ async function marcarPedidoPagado(pedidoDocId, paymentId) {
     });
 }
 
+// Un mismo pedido puede tener varios intentos de pago (una tarjeta
+// rechazada y después otra aprobada). El aviso de un intento rechazado o
+// pendiente puede llegar después del aprobado: no tiene que pisar un
+// pedido que ya está pagado.
+async function cambiarEstadoSiNoEstaPagado(pedidoDocId, nuevoStatus) {
+    const pedidoRef = db.collection('pedidos').doc(pedidoDocId);
+
+    return db.runTransaction(async (tx) => {
+        const snap = await tx.get(pedidoRef);
+        if (!snap.exists) return false;
+
+        const pedido = snap.data();
+        if (pedido.mpPaymentId || pedido.status === 'payment_confirmed') return false;
+
+        tx.update(pedidoRef, { status: nuevoStatus });
+        return true;
+    });
+}
+
 // ===================== PUNTOS (Mercado Pago) =====================
 // Para transferencia/efectivo los puntos se aplican al momento, desde
 // /confirmar-pedido-manual. Para Mercado Pago se aplican acá cuando el
@@ -506,8 +569,9 @@ async function aplicarPuntosPedido(pedidoDocId, montoPagado) {
         const pointsUsed = Math.max(0, Number(pedido.pointsUsed) || 0);
 
         // 1 punto cada $100 de productos (sin envío), igual que en
-        // /confirmar-pedido-manual. El pedido lo crea el navegador, así que
-        // el subtotal se acota con lo que Mercado Pago informa como cobrado:
+        // /confirmar-pedido-manual. Los pedidos anteriores a que
+        // /crear-preferencia los guardara los creó el navegador, así que el
+        // subtotal se acota con lo que Mercado Pago informa como cobrado:
         // nadie suma más puntos que los que corresponden a lo que pagó.
         const topePorPago = Math.floor((Math.max(0, Number(montoPagado) || 0) + pointsUsed) / 100);
         const pointsEarned = Math.max(0, Math.min(Math.floor((Number(pedido.subtotal) || 0) / 100), topePorPago));
@@ -843,14 +907,21 @@ app.post('/crear-preferencia', async (req, res) => {
 
         console.log('📦 BODY RECIBIDO:', JSON.stringify(req.body, null, 2));
 
-        let totalFinal, subtotal, deliveryCost, pointsUsed, distanceKm, distanceApprox;
+        let userId;
+        try {
+            userId = await obtenerUidVerificado(req, orderData?.userId);
+        } catch (authError) {
+            return res.status(authError.status || 401).json({ error: authError.message });
+        }
+
+        let totalFinal, subtotal, deliveryCost, pointsUsed, distanceKm, distanceApprox, validatedItems;
 
         try {
-            ({ total: totalFinal, subtotal, deliveryCost, pointsUsed, distanceKm, distanceApprox } = await calcularTotalReal(
+            ({ total: totalFinal, subtotal, deliveryCost, pointsUsed, distanceKm, distanceApprox, items: validatedItems } = await calcularTotalReal(
                 items,
                 orderData?.delivery,
                 orderData?.pointsUsed,
-                orderData?.userId,
+                userId,
                 orderData?.address
             ));
         } catch (validationError) {
@@ -863,29 +934,7 @@ app.post('/crear-preferencia', async (req, res) => {
             return res.status(400).json({ error: 'Total inválido para Mercado Pago' });
         }
 
-        const externalReference =
-            orderData.orderId ||
-            orderData.orderNumber ||
-            `LOBO-${Date.now()}`;
-
-        // El pedido ya existe en Firestore (lo crea checkout.js antes de
-        // llamar acá). Lo actualizamos con los valores validados para que
-        // el registro coincida con lo que realmente se le va a cobrar.
-        try {
-            const pedidoExistente = await buscarPedidoPorOrderId(externalReference);
-            if (pedidoExistente) {
-                await firestorePatch('pedidos', pedidoExistente.docId, {
-                    subtotal,
-                    deliveryCost,
-                    pointsUsed,
-                    distanceKm,
-                    distanceApprox,
-                    total: totalFinal
-                });
-            }
-        } catch (patchError) {
-            console.warn('⚠️ No se pudo sincronizar el pedido con el total validado:', patchError.message);
-        }
+        const externalReference = generarOrderId();
 
         const mpItems = [
             {
@@ -925,10 +974,38 @@ app.post('/crear-preferencia', async (req, res) => {
 
         console.log('✅ Preferencia creada:', result.id, '| Orden:', externalReference);
 
+        // El pedido se guarda acá, con los valores ya validados, igual que
+        // en /confirmar-pedido-manual. Antes lo guardaba el navegador y el
+        // webhook terminaba confiando en campos que el cliente podía
+        // escribir a mano (userId, puntos, subtotal). Queda en
+        // pending_payment hasta que el webhook confirme el pago.
+        const contact = (orderData?.contact && typeof orderData.contact === 'object')
+            ? orderData.contact
+            : { ...customerData, ...(orderData?.address || {}) };
+
+        await db.collection('pedidos').add({
+            orderId: externalReference,
+            userId,
+            contact,
+            items: validatedItems,
+            subtotal,
+            delivery: orderData?.delivery,
+            deliveryCost,
+            distanceKm,
+            distanceApprox,
+            pointsUsed,
+            pointsEarned: Math.floor(subtotal / 100),
+            payment: 'mp',
+            total: totalFinal,
+            status: 'pending_payment',
+            createdAt: new Date()
+        });
+
         res.json({
             id: result.id,
             init_point: result.init_point,
-            sandbox_init_point: result.sandbox_init_point
+            sandbox_init_point: result.sandbox_init_point,
+            orderId: externalReference
         });
 
     } catch (error) {
@@ -1053,11 +1130,8 @@ app.post('/enviar-email-pedido', async (req, res) => {
 // calcularTotalReal() antes de guardar nada, igual que en /crear-preferencia.
 app.post('/confirmar-pedido-manual', async (req, res) => {
     try {
-        const { orderId, items, contact, delivery, payment, pointsUsed, userId } = req.body || {};
+        const { items, contact, delivery, payment, pointsUsed } = req.body || {};
 
-        if (!orderId || typeof orderId !== 'string') {
-            return res.status(400).json({ error: 'Falta orderId' });
-        }
         if (payment !== 'transfer' && payment !== 'efectivo') {
             return res.status(400).json({ error: 'Método de pago inválido para esta ruta' });
         }
@@ -1071,6 +1145,13 @@ app.post('/confirmar-pedido-manual', async (req, res) => {
             return res.status(400).json({ error: 'Faltan datos de contacto' });
         }
 
+        let userId;
+        try {
+            userId = await obtenerUidVerificado(req, req.body?.userId);
+        } catch (authError) {
+            return res.status(authError.status || 401).json({ error: authError.message });
+        }
+
         let resultado;
         try {
             resultado = await calcularTotalReal(items, delivery, pointsUsed, userId, contact);
@@ -1079,12 +1160,19 @@ app.post('/confirmar-pedido-manual', async (req, res) => {
             return res.status(400).json({ error: validationError.message });
         }
 
+        // Se respeta el número que la página ya le mostró al cliente, salvo
+        // que no tenga el formato esperado o ya exista un pedido con él.
+        let orderId = req.body?.orderId;
+        if (typeof orderId !== 'string' || !/^LB[A-Z0-9]{6,20}$/.test(orderId) || await buscarPedidoPorOrderId(orderId)) {
+            orderId = generarOrderId();
+        }
+
         const { subtotal, deliveryCost, pointsUsed: pointsUsedFinal, total, distanceKm, distanceApprox, items: validatedItems } = resultado;
         const pointsEarned = Math.floor(subtotal / 100);
 
         const pedidoData = {
             orderId,
-            userId: userId || null,
+            userId,
             contact,
             items: validatedItems,
             subtotal,
@@ -1181,15 +1269,11 @@ app.post('/webhook', async (req, res) => {
 
         } else if (status === 'rejected') {
 
-            await firestorePatch('pedidos', pedido.docId, {
-                status: 'cancelled'
-            });
+            await cambiarEstadoSiNoEstaPagado(pedido.docId, 'cancelled');
 
         } else if (status === 'pending') {
 
-            await firestorePatch('pedidos', pedido.docId, {
-                status: 'pending_payment'
-            });
+            await cambiarEstadoSiNoEstaPagado(pedido.docId, 'pending_payment');
         }
 
     } catch (err) {
