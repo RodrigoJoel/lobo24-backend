@@ -453,6 +453,84 @@ async function descontarStockPedido(pedido) {
     }
 }
 
+// ===================== CONFIRMACIÓN DE PAGO (Mercado Pago) =====================
+// Marca el pedido como pagado y devuelve true solo si esta es la primera
+// notificación aprobada que le llega. Mercado Pago puede repetir la misma
+// notificación, o mandar varias a la vez: al decidirlo dentro de una
+// transacción, una sola de ellas descuenta stock y manda los emails.
+//
+// La marca es mpPaymentId y no solo el status, porque el status lo va
+// cambiando el admin a mano después de confirmado.
+async function marcarPedidoPagado(pedidoDocId, paymentId) {
+    const pedidoRef = db.collection('pedidos').doc(pedidoDocId);
+
+    return db.runTransaction(async (tx) => {
+        const snap = await tx.get(pedidoRef);
+        if (!snap.exists) return false;
+
+        const pedido = snap.data();
+        if (pedido.mpPaymentId || pedido.status === 'payment_confirmed') return false;
+
+        tx.update(pedidoRef, {
+            status: 'payment_confirmed',
+            mpPaymentId: String(paymentId)
+        });
+
+        return true;
+    });
+}
+
+// ===================== PUNTOS (Mercado Pago) =====================
+// Para transferencia/efectivo los puntos se aplican al momento, desde
+// /confirmar-pedido-manual. Para Mercado Pago se aplican acá cuando el
+// webhook confirma el pago — nunca antes, para no descontarle puntos a
+// alguien que no terminó de pagar.
+//
+// El saldo y la marca pointsApplied del pedido se escriben en la misma
+// transacción: Mercado Pago puede repetir la notificación (o mandar dos a
+// la vez) y los puntos se tienen que aplicar una sola vez. No alcanza con
+// mirar el status del pedido, porque el admin lo va cambiando a mano.
+//
+// Devuelve null si no había nada para hacer (pedido inexistente o puntos
+// ya aplicados).
+async function aplicarPuntosPedido(pedidoDocId, montoPagado) {
+    const pedidoRef = db.collection('pedidos').doc(pedidoDocId);
+
+    return db.runTransaction(async (tx) => {
+        const pedidoSnap = await tx.get(pedidoRef);
+        if (!pedidoSnap.exists) return null;
+
+        const pedido = pedidoSnap.data();
+        if (pedido.pointsApplied) return null;
+
+        const pointsUsed = Math.max(0, Number(pedido.pointsUsed) || 0);
+
+        // 1 punto cada $100 de productos (sin envío), igual que en
+        // /confirmar-pedido-manual. El pedido lo crea el navegador, así que
+        // el subtotal se acota con lo que Mercado Pago informa como cobrado:
+        // nadie suma más puntos que los que corresponden a lo que pagó.
+        const topePorPago = Math.floor((Math.max(0, Number(montoPagado) || 0) + pointsUsed) / 100);
+        const pointsEarned = Math.max(0, Math.min(Math.floor((Number(pedido.subtotal) || 0) / 100), topePorPago));
+
+        let newPoints = null;
+
+        if (pedido.userId) {
+            const userRef = db.collection('users').doc(pedido.userId);
+            const userSnap = await tx.get(userRef);
+
+            if (userSnap.exists) {
+                const currentPoints = Number(userSnap.data().points || 0);
+                newPoints = Math.max(0, currentPoints - pointsUsed + pointsEarned);
+                tx.update(userRef, { points: newPoints });
+            }
+        }
+
+        tx.update(pedidoRef, { pointsApplied: true, pointsEarned });
+
+        return { pointsUsed, pointsEarned, newPoints };
+    });
+}
+
 // ===================== HELPERS DE EMAIL =====================
 
 function money(n) {
@@ -1076,12 +1154,18 @@ app.post('/webhook', async (req, res) => {
             // Mercado Pago puede reenviar la misma notificación más de una
             // vez. Si el pedido ya estaba confirmado, no volvemos a
             // descontar stock ni a reenviar el email.
-            const yaEstabaConfirmado = pedido.status === 'payment_confirmed';
+            const yaEstabaConfirmado = !(await marcarPedidoPagado(pedido.docId, data.id));
 
-            await firestorePatch('pedidos', pedido.docId, {
-                status: 'payment_confirmed',
-                mpPaymentId: String(data.id)
-            });
+            // Los puntos tienen su propia marca (pointsApplied), así que
+            // se llama siempre: si ya se aplicaron, no hace nada.
+            try {
+                const puntos = await aplicarPuntosPedido(pedido.docId, payInfo.transaction_amount);
+                if (puntos && puntos.newPoints !== null) {
+                    console.log('⭐ Puntos aplicados:', `-${puntos.pointsUsed} +${puntos.pointsEarned}`, '| Saldo:', puntos.newPoints);
+                }
+            } catch (err) {
+                console.error('❌ Error aplicando puntos del pedido:', err.message);
+            }
 
             if (yaEstabaConfirmado) {
                 console.log('ℹ️ Pedido ya estaba confirmado, se ignora la notificación repetida');
