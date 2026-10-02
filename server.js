@@ -505,22 +505,30 @@ async function descontarStockPedido(pedido) {
 //
 // La marca es mpPaymentId y no solo el status, porque el status lo va
 // cambiando el admin a mano después de confirmado.
+//
+// Devuelve null si no es la primera, o { descontarStock }: el admin puede
+// haber dado el pedido por pagado a mano antes de que llegara el aviso (el
+// panel ya descontó el stock y lo dejó anotado en stockDescontado), y en
+// ese caso tampoco se le pisa el estado en el que lo dejó.
 async function marcarPedidoPagado(pedidoDocId, paymentId) {
     const pedidoRef = db.collection('pedidos').doc(pedidoDocId);
 
     return db.runTransaction(async (tx) => {
         const snap = await tx.get(pedidoRef);
-        if (!snap.exists) return false;
+        if (!snap.exists) return null;
 
         const pedido = snap.data();
-        if (pedido.mpPaymentId || pedido.status === 'payment_confirmed') return false;
+        if (pedido.mpPaymentId || pedido.status === 'payment_confirmed') return null;
+
+        const sinAvanzar = !pedido.status || pedido.status === 'pending_payment' || pedido.status === 'cancelled';
 
         tx.update(pedidoRef, {
-            status: 'payment_confirmed',
-            mpPaymentId: String(paymentId)
+            status: sinAvanzar ? 'payment_confirmed' : pedido.status,
+            mpPaymentId: String(paymentId),
+            stockDescontado: true
         });
 
-        return true;
+        return { descontarStock: pedido.stockDescontado !== true };
     });
 }
 
@@ -567,6 +575,9 @@ async function aplicarPuntosPedido(pedidoDocId, montoPagado) {
         if (pedido.pointsApplied) return null;
 
         const pointsUsed = Math.max(0, Number(pedido.pointsUsed) || 0);
+        // Si los puntos usados ya se descontaron (pointsUsedApplied), no se
+        // vuelven a restar.
+        const aDescontar = pedido.pointsUsedApplied === true ? 0 : pointsUsed;
 
         // 1 punto cada $100 de productos (sin envío), igual que en
         // /confirmar-pedido-manual. Los pedidos anteriores a que
@@ -584,14 +595,14 @@ async function aplicarPuntosPedido(pedidoDocId, montoPagado) {
 
             if (userSnap.exists) {
                 const currentPoints = Number(userSnap.data().points || 0);
-                newPoints = Math.max(0, currentPoints - pointsUsed + pointsEarned);
+                newPoints = Math.max(0, currentPoints - aDescontar + pointsEarned);
                 tx.update(userRef, { points: newPoints });
             }
         }
 
-        tx.update(pedidoRef, { pointsApplied: true, pointsEarned });
+        tx.update(pedidoRef, { pointsApplied: true, pointsUsedApplied: true, pointsEarned });
 
-        return { pointsUsed, pointsEarned, newPoints };
+        return { pointsUsed: aDescontar, pointsEarned, newPoints };
     });
 }
 
@@ -618,6 +629,15 @@ function paymentLabel(payment) {
     if (payment === 'transfer')  return 'Transferencia bancaria';
     if (payment === 'efectivo')  return 'Efectivo en local';
     return payment || 'No informado';
+}
+
+function statusLabel(status) {
+    if (status === 'pending')           return 'Pendiente de pago';
+    if (status === 'pending_payment')   return 'Mercado Pago sin pagar';
+    if (status === 'payment_confirmed') return 'Pago acreditado por Mercado Pago';
+    if (status === 'confirmed')         return 'Pago confirmado';
+    if (status === 'cancelled')         return 'Cancelado';
+    return status || '—';
 }
 
 function deliveryLabel(delivery) {
@@ -702,12 +722,12 @@ function buildPedidoEmailHtml(pedido, tipo = 'cliente') {
     const vendedorStatusBlock = `
       <div style="background:#fef3c7;border-left:4px solid #d97706;border-radius:0 8px 8px 0;padding:14px 18px;margin:20px 0;font-size:14px;color:#92400e">
         <strong>Método de pago:</strong> ${escHtml(paymentLabel(pedido.payment))}<br>
-        <strong>Estado:</strong> ${escHtml(pedido.status || '—')}<br>
+        <strong>Estado:</strong> ${escHtml(statusLabel(pedido.status))}<br>
         ${pedido.payment === 'transfer'
-          ? '<strong>Acción requerida:</strong> Aguardá el comprobante del cliente por WhatsApp.'
+          ? '<strong>Acción requerida:</strong> Aguardá el comprobante del cliente por WhatsApp y confirmá el pago en el panel: recién ahí se le acreditan los puntos.'
           : pedido.payment === 'mp'
-          ? '<strong>Acción requerida:</strong> El pago será confirmado automáticamente vía webhook.'
-          : '<strong>Acción requerida:</strong> El cliente pagará en efectivo al retirar.'}
+          ? '<strong>Acción requerida:</strong> Ninguna: Mercado Pago ya acreditó el pago.'
+          : '<strong>Acción requerida:</strong> El cliente pagará en efectivo al retirar. Los puntos se le acreditan cuando marcás el pedido como entregado.'}
       </div>
     `;
 
@@ -1010,6 +1030,10 @@ app.post('/crear-preferencia', async (req, res) => {
             payment: 'mp',
             total: totalFinal,
             status: 'pending_payment',
+            // Nada se descuenta ni se acredita hasta que se acredite el pago.
+            stockDescontado: false,
+            pointsUsedApplied: false,
+            pointsApplied: false,
             createdAt: new Date()
         });
 
@@ -1162,6 +1186,15 @@ app.post('/confirmar-pedido-manual', async (req, res) => {
         const { subtotal, deliveryCost, pointsUsed: pointsUsedFinal, total, distanceKm, distanceApprox, items: validatedItems } = resultado;
         const pointsEarned = Math.floor(subtotal / 100);
 
+        // El pedido nace "pendiente de pago": nadie pagó todavía. Los puntos
+        // que gana la compra se acreditan cuando el admin confirma el pago o
+        // marca el pedido como entregado (js/pedidos-estado.js); antes se
+        // acreditaban acá, y alcanzaba con hacer pedidos sin pagarlos para
+        // juntar puntos.
+        //
+        // Los puntos que el cliente USA sí se descuentan acá, en la misma
+        // transacción que guarda el pedido: así no se pueden usar los mismos
+        // puntos en dos pedidos. Si el pedido se cancela, se devuelven.
         const pedidoData = {
             orderId,
             userId,
@@ -1176,31 +1209,40 @@ app.post('/confirmar-pedido-manual', async (req, res) => {
             pointsEarned,
             payment,
             total,
-            status: 'confirmed',
+            status: 'pending',
+            stockDescontado: true,
+            pointsUsedApplied: pointsUsedFinal > 0,
+            pointsApplied: false,
             createdAt: new Date()
         };
 
-        await db.collection('pedidos').add(pedidoData);
-        await descontarStockPedido({ items: validatedItems });
+        const pedidoRef = db.collection('pedidos').doc();
 
-        if (userId) {
-            try {
-                const userRef = db.collection('users').doc(userId);
-                await db.runTransaction(async (tx) => {
+        try {
+            await db.runTransaction(async (tx) => {
+                if (userId && pointsUsedFinal > 0) {
+                    const userRef = db.collection('users').doc(userId);
                     const snap = await tx.get(userRef);
-                    if (!snap.exists) return;
-                    const currentPoints = Number(snap.data().points || 0);
-                    const newPoints = Math.max(0, currentPoints - pointsUsedFinal + pointsEarned);
-                    tx.update(userRef, { points: newPoints });
-                });
-            } catch (err) {
-                console.error('❌ Error actualizando puntos del usuario:', err.message);
-            }
+                    const disponibles = snap.exists ? Number(snap.data().points || 0) : 0;
+                    if (disponibles < pointsUsedFinal) {
+                        const err = new Error('Tus puntos cambiaron mientras armabas el pedido. Recargá la página y volvé a confirmarlo.');
+                        err.status = 409;
+                        throw err;
+                    }
+                    tx.update(userRef, { points: disponibles - pointsUsedFinal });
+                }
+                tx.set(pedidoRef, pedidoData);
+            });
+        } catch (err) {
+            if (err.status === 409) return res.status(409).json({ error: err.message });
+            throw err;
         }
+
+        await descontarStockPedido({ items: validatedItems });
 
         await enviarEmailsPedido(pedidoData);
 
-        res.json({ ok: true, orderId, subtotal, deliveryCost, pointsUsed: pointsUsedFinal, pointsEarned, total });
+        res.json({ ok: true, orderId, status: pedidoData.status, subtotal, deliveryCost, pointsUsed: pointsUsedFinal, pointsEarned, total });
     } catch (err) {
         console.error('❌ Error en /confirmar-pedido-manual:', err);
         res.status(500).json({ error: 'Error interno al confirmar el pedido' });
@@ -1234,7 +1276,8 @@ app.post('/webhook', async (req, res) => {
             // Mercado Pago puede reenviar la misma notificación más de una
             // vez. Si el pedido ya estaba confirmado, no volvemos a
             // descontar stock ni a reenviar el email.
-            const yaEstabaConfirmado = !(await marcarPedidoPagado(pedido.docId, data.id));
+            const primera = await marcarPedidoPagado(pedido.docId, data.id);
+            const yaEstabaConfirmado = !primera;
 
             // Los puntos tienen su propia marca (pointsApplied), así que
             // se llama siempre: si ya se aplicaron, no hace nada.
@@ -1250,8 +1293,10 @@ app.post('/webhook', async (req, res) => {
             if (yaEstabaConfirmado) {
                 console.log('ℹ️ Pedido ya estaba confirmado, se ignora la notificación repetida');
             } else {
-                await descontarStockPedido(pedido);
-                console.log('✅ Pedido aprobado, stock descontado');
+                if (primera.descontarStock) {
+                    await descontarStockPedido(pedido);
+                }
+                console.log('✅ Pedido aprobado' + (primera.descontarStock ? ', stock descontado' : ' (el stock ya se había descontado)'));
                 await enviarEmailsPedido({
                     ...pedido,
                     status: 'payment_confirmed',
