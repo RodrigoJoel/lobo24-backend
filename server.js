@@ -601,6 +601,18 @@ function money(n) {
     return `$${Number(n || 0).toLocaleString('es-AR')}`;
 }
 
+// Los datos que escribe el cliente (nombre, dirección, notas) van al email
+// como texto. Sin esto, alguien podría meter HTML propio (un link falso,
+// por ejemplo) en el email que le llega al local.
+function escHtml(v) {
+    return String(v ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 function paymentLabel(payment) {
     if (payment === 'mp')        return 'Mercado Pago';
     if (payment === 'transfer')  return 'Transferencia bancaria';
@@ -667,8 +679,8 @@ function buildPedidoEmailHtml(pedido, tipo = 'cliente') {
 
     const productosHtml = items.map(item => `
         <tr>
-          <td style="padding:10px 12px;border-bottom:1px solid #f0f0f0;font-size:14px">${item.name || ''}</td>
-          <td style="padding:10px 12px;border-bottom:1px solid #f0f0f0;text-align:center;font-size:14px">${item.qty || 1}</td>
+          <td style="padding:10px 12px;border-bottom:1px solid #f0f0f0;font-size:14px">${escHtml(item.name)}</td>
+          <td style="padding:10px 12px;border-bottom:1px solid #f0f0f0;text-align:center;font-size:14px">${escHtml(item.qty || 1)}</td>
           <td style="padding:10px 12px;border-bottom:1px solid #f0f0f0;text-align:right;font-size:14px">${money(item.price)}</td>
           <td style="padding:10px 12px;border-bottom:1px solid #f0f0f0;text-align:right;font-size:14px;font-weight:600">${money(item.subtotal || Number(item.price || 0) * Number(item.qty || 1))}</td>
         </tr>
@@ -676,7 +688,7 @@ function buildPedidoEmailHtml(pedido, tipo = 'cliente') {
 
     const statusMsg   = getStatusMessage(pedido.payment);
     const whatsLink   = `https://wa.me/${STORE_WHATSAPP}?text=${encodeURIComponent(`Hola Lobo24! Mi pedido es #${pedido.orderId || ''}. Quiero hacer una consulta.`)}`;
-    const orderNum    = pedido.orderId || pedido.orderNumber || pedido.docId || '';
+    const orderNum    = escHtml(pedido.orderId || pedido.orderNumber || pedido.docId || '');
 
     // ── Bloque específico para el cliente ──
     const clienteStatusBlock = `
@@ -689,8 +701,8 @@ function buildPedidoEmailHtml(pedido, tipo = 'cliente') {
     // ── Bloque específico para el vendedor ──
     const vendedorStatusBlock = `
       <div style="background:#fef3c7;border-left:4px solid #d97706;border-radius:0 8px 8px 0;padding:14px 18px;margin:20px 0;font-size:14px;color:#92400e">
-        <strong>Método de pago:</strong> ${paymentLabel(pedido.payment)}<br>
-        <strong>Estado:</strong> ${pedido.status || '—'}<br>
+        <strong>Método de pago:</strong> ${escHtml(paymentLabel(pedido.payment))}<br>
+        <strong>Estado:</strong> ${escHtml(pedido.status || '—')}<br>
         ${pedido.payment === 'transfer'
           ? '<strong>Acción requerida:</strong> Aguardá el comprobante del cliente por WhatsApp.'
           : pedido.payment === 'mp'
@@ -738,11 +750,11 @@ function buildPedidoEmailHtml(pedido, tipo = 'cliente') {
                       <td style="padding:16px 20px">
                         <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:#9ca3af;margin-bottom:12px">Datos del cliente</div>
                         <table cellpadding="0" cellspacing="0">
-                          <tr><td style="font-size:13px;color:#6b7280;padding-bottom:6px;min-width:90px">👤 Nombre</td><td style="font-size:13px;color:#111827;font-weight:600;padding-bottom:6px">${contact.name || '—'}</td></tr>
-                          <tr><td style="font-size:13px;color:#6b7280;padding-bottom:6px">📧 Email</td><td style="font-size:13px;color:#111827;padding-bottom:6px">${contact.email || '—'}</td></tr>
-                          <tr><td style="font-size:13px;color:#6b7280;padding-bottom:6px">📱 Teléfono</td><td style="font-size:13px;color:#111827;padding-bottom:6px">${contact.phone || '—'}</td></tr>
-                          <tr><td style="font-size:13px;color:#6b7280;padding-bottom:6px">📍 Dirección</td><td style="font-size:13px;color:#111827;padding-bottom:6px">${[contact.street, contact.city, contact.province].filter(Boolean).join(', ') || '—'}</td></tr>
-                          ${contact.notes ? `<tr><td style="font-size:13px;color:#6b7280">💬 Notas</td><td style="font-size:13px;color:#111827">${contact.notes}</td></tr>` : ''}
+                          <tr><td style="font-size:13px;color:#6b7280;padding-bottom:6px;min-width:90px">👤 Nombre</td><td style="font-size:13px;color:#111827;font-weight:600;padding-bottom:6px">${escHtml(contact.name || '—')}</td></tr>
+                          <tr><td style="font-size:13px;color:#6b7280;padding-bottom:6px">📧 Email</td><td style="font-size:13px;color:#111827;padding-bottom:6px">${escHtml(contact.email || '—')}</td></tr>
+                          <tr><td style="font-size:13px;color:#6b7280;padding-bottom:6px">📱 Teléfono</td><td style="font-size:13px;color:#111827;padding-bottom:6px">${escHtml(contact.phone || '—')}</td></tr>
+                          <tr><td style="font-size:13px;color:#6b7280;padding-bottom:6px">📍 Dirección</td><td style="font-size:13px;color:#111827;padding-bottom:6px">${escHtml([contact.street, contact.city, contact.province].filter(Boolean).join(', ') || '—')}</td></tr>
+                          ${contact.notes ? `<tr><td style="font-size:13px;color:#6b7280">💬 Notas</td><td style="font-size:13px;color:#111827">${escHtml(contact.notes)}</td></tr>` : ''}
                         </table>
                       </td>
                     </tr>
@@ -753,7 +765,7 @@ function buildPedidoEmailHtml(pedido, tipo = 'cliente') {
                     <tr>
                       <td style="padding:16px 20px">
                         <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:#9ca3af;margin-bottom:10px">Entrega</div>
-                        <div style="font-size:14px;color:#111827">🚚 ${deliveryLabel(pedido.delivery)}</div>
+                        <div style="font-size:14px;color:#111827">🚚 ${escHtml(deliveryLabel(pedido.delivery))}</div>
                       </td>
                     </tr>
                   </table>
@@ -1098,26 +1110,6 @@ app.post('/sincronizar-stock-pos', async (req, res) => {
     } catch (err) {
         console.error('❌ Error en /sincronizar-stock-pos:', err);
         res.status(500).json({ error: 'Error interno' });
-    }
-});
-
-// ===================== ENDPOINT: EMAIL PARA PEDIDOS NO-MP =====================
-// checkout.js lo llama luego de guardar en Firestore (transfer / efectivo)
-
-app.post('/enviar-email-pedido', async (req, res) => {
-    try {
-        const pedido = req.body;
-
-        if (!pedido || !pedido.orderId) {
-            return res.status(400).json({ error: 'Datos de pedido inválidos' });
-        }
-
-        await enviarEmailsPedido(pedido);
-
-        res.json({ ok: true });
-    } catch (err) {
-        console.error('❌ Error en /enviar-email-pedido:', err);
-        res.status(500).json({ error: 'Error al enviar email' });
     }
 });
 
