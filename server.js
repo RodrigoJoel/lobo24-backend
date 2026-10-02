@@ -389,48 +389,150 @@ async function validarDistanciaEnvio(direccion) {
     return { distanceKm, maxKm: RADIO_KM, approx };
 }
 
+// Colecciones del catálogo. Un pedido solo puede llevar productos de acá.
+const COLECCIONES_VALIDAS_LOBO24 = [
+    'bebidas', 'snacks', 'almacen', 'higiene', 'limpieza',
+    'congelados', 'lacteos', 'panaderia', 'mascotas',
+    'perfumeria', 'bazar'
+];
+
+// "Más vendidos" y "Novedades" de la portada. Cada documento apunta a un
+// producto del catálogo (coleccion + productId). Los más viejos son copias
+// sueltas, con su propio precio y sin stock: si el pedido se validara contra
+// la copia, se cobraría un precio que puede estar desactualizado y no se
+// descontaría el stock del producto de verdad.
+const COLECCIONES_DESTACADOS = ['bestSellers', 'newProducts'];
+
+const MAX_UNIDADES_POR_PRODUCTO = 500;
+
+const idValido = (id) => typeof id === 'string' && id.length > 0 && id.length <= 200 && !id.includes('/');
+
+// Busca en el catálogo los productos que se llaman exactamente así.
+async function buscarProductosPorNombre(nombre) {
+    if (typeof nombre !== 'string' || !nombre.trim()) return [];
+
+    const snaps = await Promise.all(COLECCIONES_VALIDAS_LOBO24.map(
+        (c) => db.collection(c).where('name', '==', nombre).limit(2).get()
+    ));
+
+    const encontrados = [];
+    snaps.forEach((snap, i) => snap.docs.forEach((d) => {
+        encontrados.push({ coleccion: COLECCIONES_VALIDAS_LOBO24[i], docId: d.id, producto: d.data() });
+    }));
+    return encontrados;
+}
+
+// Devuelve el producto del catálogo que corresponde a un item del carrito:
+// { coleccion, docId, producto }. Lanza un Error con mensaje para el cliente
+// si el item no se puede vender.
+async function resolverProducto(item) {
+    const nombre = item.name ? `"${String(item.name).slice(0, 80)}"` : 'Un producto del carrito';
+
+    if (!idValido(item.id)) {
+        throw new Error(`${nombre} ya no está disponible. Quitalo del carrito para continuar.`);
+    }
+
+    if (COLECCIONES_VALIDAS_LOBO24.includes(item.coleccion)) {
+        const producto = await firestoreGet(item.coleccion, item.id);
+        if (!producto) {
+            throw new Error(`${nombre} ya no está disponible. Quitalo del carrito para continuar.`);
+        }
+        return { coleccion: item.coleccion, docId: item.id, producto };
+    }
+
+    if (COLECCIONES_DESTACADOS.includes(item.coleccion)) {
+        const destacado = await firestoreGet(item.coleccion, item.id);
+
+        if (destacado) {
+            // Vinculado a su producto real
+            const idReal = destacado.productId;
+            if (COLECCIONES_VALIDAS_LOBO24.includes(destacado.coleccion) && idValido(idReal)) {
+                const producto = await firestoreGet(destacado.coleccion, idReal);
+                if (producto) return { coleccion: destacado.coleccion, docId: idReal, producto };
+            }
+
+            // Copia suelta: se busca el producto real por su nombre
+            const encontrados = await buscarProductosPorNombre(destacado.name);
+            if (encontrados.length) {
+                const mismoPrecio = encontrados.find((e) => Number(e.producto.price) === Number(destacado.price));
+                const elegido = mismoPrecio || encontrados[0];
+
+                // Si hay uno solo, queda vinculado para la próxima vez.
+                if (encontrados.length === 1) {
+                    await firestorePatch(item.coleccion, item.id, { coleccion: elegido.coleccion, productId: elegido.docId });
+                }
+                return elegido;
+            }
+        }
+
+        const nombreDestacado = destacado?.name ? `"${String(destacado.name).slice(0, 80)}"` : nombre;
+        throw new Error(`${nombreDestacado} no se puede comprar desde la portada en este momento. Quitalo del carrito y agregalo desde su categoría.`);
+    }
+
+    throw new Error(`${nombre} ya no está disponible. Quitalo del carrito para continuar.`);
+}
+
 async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId, direccion) {
     let subtotal = 0;
     const validatedItems = [];
 
+    // 1) Cada item se lleva a su producto del catálogo. Si el mismo producto
+    // viene en dos renglones, las cantidades se suman antes de mirar el
+    // límite por pedido y el stock.
+    const porProducto = new Map();
+
     for (const item of items) {
         if (!item || !item.coleccion || !item.id) {
-            throw new Error('Item sin coleccion/id válidos');
+            throw new Error('Hay un producto del carrito que ya no está disponible. Vaciá el carrito y volvé a armarlo.');
         }
 
-        const qty = Number(item.quantity || 0);
-        if (!Number.isFinite(qty) || qty <= 0) {
-            throw new Error(`Cantidad inválida para ${item.id}`);
+        const qty = Number(item.quantity);
+        if (!Number.isInteger(qty) || qty <= 0 || qty > MAX_UNIDADES_POR_PRODUCTO) {
+            throw new Error(`La cantidad de ${item.name ? `"${String(item.name).slice(0, 80)}"` : 'un producto'} no es válida. Corregila en el carrito.`);
         }
 
-        const producto = await firestoreGet(item.coleccion, item.id);
-        if (!producto) {
-            throw new Error(`Producto no encontrado: ${item.coleccion}/${item.id}`);
-        }
+        const resuelto = await resolverProducto(item);
+        const clave = resuelto.coleccion + '/' + resuelto.docId;
+        const previo = porProducto.get(clave);
 
+        if (previo) previo.qty += qty;
+        else porProducto.set(clave, { ...resuelto, qty });
+    }
+
+    // 2) Precio, límite por pedido y stock, contra el producto real
+    for (const { coleccion, docId, producto, qty } of porProducto.values()) {
+        const nombre = producto.name || docId;
         const precioReal = Number(producto.price || 0);
 
         if (!Number.isFinite(precioReal) || precioReal <= 0) {
-            throw new Error(`Precio inválido para ${item.coleccion}/${item.id}`);
+            throw new Error(`"${nombre}" no tiene un precio válido en este momento. Quitalo del carrito para continuar.`);
         }
 
         const limite = producto.maxPorCompra != null ? Number(producto.maxPorCompra) : null;
         if (limite !== null && qty > limite) {
-            throw new Error(`"${producto.name || item.id}" tiene un límite de ${limite} unidad${limite !== 1 ? 'es' : ''} por pedido`);
+            throw new Error(`"${nombre}" tiene un límite de ${limite} unidad${limite !== 1 ? 'es' : ''} por pedido`);
+        }
+
+        // stock sin cargar = producto sin control de stock
+        const stock = producto.stock != null ? Number(producto.stock) : null;
+        if (stock !== null && qty > stock) {
+            throw new Error(stock <= 0
+                ? `"${nombre}" se quedó sin stock. Quitalo del carrito para continuar.`
+                : `De "${nombre}" ${stock !== 1 ? 'quedan' : 'queda'} ${stock} unidad${stock !== 1 ? 'es' : ''} y pediste ${qty}. Ajustá la cantidad en el carrito.`);
         }
 
         subtotal += precioReal * qty;
 
         validatedItems.push({
-            docId: item.id,
-            coleccion: item.coleccion,
-            name: producto.name || item.name || '',
+            docId,
+            coleccion,
+            name: producto.name || '',
             brand: producto.brand || '',
             img: producto.img || '',
             price: precioReal,
             qty,
             subtotal: precioReal * qty,
-            stockOriginal: producto.stock != null ? Number(producto.stock) : null
+            stockOriginal: stock
         });
     }
 
@@ -1059,12 +1161,6 @@ app.post('/crear-preferencia', async (req, res) => {
 // nada, por eso acá sí se verifica de verdad que quien llama es un admin
 // logueado en sistema-ventas en este momento (no alcanza con tener una
 // clave copiada de algún lado).
-const COLECCIONES_VALIDAS_LOBO24 = [
-    'bebidas', 'snacks', 'almacen', 'higiene', 'limpieza',
-    'congelados', 'lacteos', 'panaderia', 'mascotas',
-    'perfumeria', 'bazar'
-];
-
 // Acepta stock y/o price — el nombre de la ruta quedó del alcance
 // original (solo stock), pero ahora también sincroniza precio: ninguno de
 // los dos se puede tocar sin login en las reglas de Lobo24, así que los
@@ -1218,27 +1314,59 @@ app.post('/confirmar-pedido-manual', async (req, res) => {
 
         const pedidoRef = db.collection('pedidos').doc();
 
+        // El stock también va en la transacción: se vuelve a mirar justo
+        // antes de guardar, para que dos pedidos simultáneos no se lleven la
+        // misma última unidad.
+        const conflicto = (mensaje) => Object.assign(new Error(mensaje), { status: 409 });
+
         try {
             await db.runTransaction(async (tx) => {
+                // Lecturas (Firestore las exige antes de cualquier escritura)
+                let userRef = null;
+                let disponibles = 0;
                 if (userId && pointsUsedFinal > 0) {
-                    const userRef = db.collection('users').doc(userId);
+                    userRef = db.collection('users').doc(userId);
                     const snap = await tx.get(userRef);
-                    const disponibles = snap.exists ? Number(snap.data().points || 0) : 0;
-                    if (disponibles < pointsUsedFinal) {
-                        const err = new Error('Tus puntos cambiaron mientras armabas el pedido. Recargá la página y volvé a confirmarlo.');
-                        err.status = 409;
-                        throw err;
-                    }
-                    tx.update(userRef, { points: disponibles - pointsUsedFinal });
+                    disponibles = snap.exists ? Number(snap.data().points || 0) : 0;
                 }
+
+                const productos = [];
+                for (const item of validatedItems) {
+                    const ref = db.collection(item.coleccion).doc(item.docId);
+                    productos.push({ ref, item, snap: await tx.get(ref) });
+                }
+
+                // Verificaciones
+                if (userRef && disponibles < pointsUsedFinal) {
+                    throw conflicto('Tus puntos cambiaron mientras armabas el pedido. Recargá la página y volvé a confirmarlo.');
+                }
+
+                for (const { item, snap } of productos) {
+                    if (!snap.exists) {
+                        throw conflicto(`"${item.name}" ya no está disponible. Quitalo del carrito para continuar.`);
+                    }
+                    const stockActual = snap.data().stock;
+                    if (stockActual === undefined || stockActual === null) continue; // sin control de stock
+                    if (Number(stockActual) < item.qty) {
+                        throw conflicto(`"${item.name}" se acaba de quedar sin stock suficiente. Revisá el carrito y volvé a confirmar.`);
+                    }
+                }
+
+                // Escrituras
+                if (userRef) tx.update(userRef, { points: disponibles - pointsUsedFinal });
+
+                for (const { ref, item, snap } of productos) {
+                    const stockActual = snap.data().stock;
+                    if (stockActual === undefined || stockActual === null) continue;
+                    tx.update(ref, { stock: Number(stockActual) - item.qty });
+                }
+
                 tx.set(pedidoRef, pedidoData);
             });
         } catch (err) {
             if (err.status === 409) return res.status(409).json({ error: err.message });
             throw err;
         }
-
-        await descontarStockPedido({ items: validatedItems });
 
         await enviarEmailsPedido(pedidoData);
 
