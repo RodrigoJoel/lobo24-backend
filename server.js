@@ -559,6 +559,14 @@ async function calcularTotalReal(items, delivery, pointsUsedSolicitado, userId, 
         const usuario = await firestoreGet('users', userId);
         if (usuario) {
             const puntosDisponibles = Number(usuario.points || 0);
+
+            // La página quedó con un saldo viejo (por ejemplo, los puntos
+            // están reservados en otro pedido). Antes se aplicaban menos
+            // puntos sin avisar y el cliente pagaba más de lo que veía.
+            if (pointsSolicitados > puntosDisponibles) {
+                throw new Error(`Quisiste usar ${pointsSolicitados} puntos y tenés ${puntosDisponibles} disponibles. Recargá la página y volvé a elegir cuántos usar.`);
+            }
+
             const maxAplicable = Math.floor((subtotal + deliveryCost) * 0.30);
             pointsUsed = Math.max(0, Math.min(pointsSolicitados, puntosDisponibles, maxAplicable));
         }
@@ -612,6 +620,11 @@ async function descontarStockPedido(pedido) {
 // haber dado el pedido por pagado a mano antes de que llegara el aviso (el
 // panel ya descontó el stock y lo dejó anotado en stockDescontado), y en
 // ese caso tampoco se le pisa el estado en el que lo dejó.
+// Un pedido de Mercado Pago que nadie tocó a mano: sin pagar, o cancelado
+// porque el pago se rechazó o nunca se hizo. Si el admin ya lo movió a otro
+// estado desde el panel, los avisos de Mercado Pago no se lo pisan.
+const pedidoSinAvanzar = (status) => !status || status === 'pending_payment' || status === 'cancelled';
+
 async function marcarPedidoPagado(pedidoDocId, paymentId) {
     const pedidoRef = db.collection('pedidos').doc(pedidoDocId);
 
@@ -622,11 +635,10 @@ async function marcarPedidoPagado(pedidoDocId, paymentId) {
         const pedido = snap.data();
         if (pedido.mpPaymentId || pedido.status === 'payment_confirmed') return null;
 
-        const sinAvanzar = !pedido.status || pedido.status === 'pending_payment' || pedido.status === 'cancelled';
-
         tx.update(pedidoRef, {
-            status: sinAvanzar ? 'payment_confirmed' : pedido.status,
+            status: pedidoSinAvanzar(pedido.status) ? 'payment_confirmed' : pedido.status,
             mpPaymentId: String(paymentId),
+            mpPagoEnProceso: false,
             stockDescontado: true
         });
 
@@ -638,7 +650,11 @@ async function marcarPedidoPagado(pedidoDocId, paymentId) {
 // rechazada y después otra aprobada). El aviso de un intento rechazado o
 // pendiente puede llegar después del aprobado: no tiene que pisar un
 // pedido que ya está pagado.
-async function cambiarEstadoSiNoEstaPagado(pedidoDocId, nuevoStatus) {
+//
+// Mercado Pago avisa que hay un pago en curso (por ejemplo, un cupón para
+// pagar en efectivo, que puede tardar días). Mientras esté en curso, los
+// puntos reservados del pedido no se devuelven por vencimiento.
+async function marcarPagoEnProceso(pedidoDocId) {
     const pedidoRef = db.collection('pedidos').doc(pedidoDocId);
 
     return db.runTransaction(async (tx) => {
@@ -646,11 +662,138 @@ async function cambiarEstadoSiNoEstaPagado(pedidoDocId, nuevoStatus) {
         if (!snap.exists) return false;
 
         const pedido = snap.data();
-        if (pedido.mpPaymentId || pedido.status === 'payment_confirmed') return false;
+        if (pedido.mpPaymentId || !pedidoSinAvanzar(pedido.status)) return false;
 
-        tx.update(pedidoRef, { status: nuevoStatus });
+        tx.update(pedidoRef, { status: 'pending_payment', mpPagoEnProceso: true });
         return true;
     });
+}
+
+// ===================== PUNTOS RESERVADOS (Mercado Pago) =====================
+// Un pedido de Mercado Pago que usa puntos los descuenta del saldo al
+// crearse, igual que uno por transferencia. Antes se descontaban recién
+// cuando se acreditaba el pago, y con el mismo saldo se podían abrir varios
+// pagos a la vez y cobrar el descuento en todos.
+//
+// Si el pago no se hace, los puntos vuelven solos: el link de pago vence a
+// los MP_MINUTOS_PARA_PAGAR minutos y, pasado ese plazo más un margen, el
+// pedido se cancela y los puntos se le devuelven al cliente. También vuelven
+// en el momento si Mercado Pago rechaza el pago o si el admin cancela el
+// pedido desde el panel (js/pedidos-estado.js).
+const MP_MINUTOS_PARA_PAGAR = 30;
+const RESERVA_MARGEN_MINUTOS = 5;
+
+// Mercado Pago espera la fecha con la diferencia horaria escrita. Se manda
+// en hora de Argentina (no tiene horario de verano).
+function fechaMercadoPago(fecha) {
+    return new Date(fecha.getTime() - 3 * 60 * 60 * 1000).toISOString().replace('Z', '-03:00');
+}
+
+function aFecha(valor) {
+    if (!valor) return null;
+    const fecha = typeof valor.toDate === 'function' ? valor.toDate() : new Date(valor);
+    return Number.isNaN(fecha.getTime()) ? null : fecha;
+}
+
+// Cancela un pedido de Mercado Pago que no se pagó y le devuelve al cliente
+// los puntos que tenía reservados. No toca un pedido ya pagado ni uno que el
+// admin movió a mano. Con soloSiVencio, tampoco uno que todavía está a
+// tiempo de pagarse o que tiene un pago en curso.
+//
+// Devuelve null si no hizo nada, o { devueltos } con los puntos devueltos.
+async function cancelarPedidoSinPago(pedidoDocId, motivo, { soloSiVencio = false } = {}) {
+    const pedidoRef = db.collection('pedidos').doc(pedidoDocId);
+
+    return db.runTransaction(async (tx) => {
+        const snap = await tx.get(pedidoRef);
+        if (!snap.exists) return null;
+
+        const pedido = snap.data();
+        if (pedido.mpPaymentId || !pedidoSinAvanzar(pedido.status)) return null;
+
+        if (soloSiVencio) {
+            if (pedido.status !== 'pending_payment' || pedido.mpPagoEnProceso === true) return null;
+            const vence = aFecha(pedido.reservaPuntosVence);
+            if (!vence || vence > new Date()) return null;
+        }
+
+        const cambios = { status: 'cancelled', mpPagoEnProceso: false, motivoCancelacion: motivo };
+        const reservados = pedido.pointsUsedApplied === true ? Math.max(0, Number(pedido.pointsUsed) || 0) : 0;
+        let devueltos = 0;
+
+        if (reservados > 0) {
+            cambios.pointsUsedApplied = false;
+
+            if (pedido.userId) {
+                const userRef = db.collection('users').doc(pedido.userId);
+                const userSnap = await tx.get(userRef);
+
+                if (userSnap.exists) {
+                    tx.update(userRef, { points: Number(userSnap.data().points || 0) + reservados });
+                    devueltos = reservados;
+                }
+            }
+        }
+
+        tx.update(pedidoRef, cambios);
+        return { devueltos };
+    });
+}
+
+// Pedidos de Mercado Pago sin pagar que tienen puntos reservados. Con
+// userId, los de esa cuenta; sin userId, los de todas.
+async function buscarReservasAbiertas(userId) {
+    let consulta = db.collection('pedidos')
+        .where('status', '==', 'pending_payment')
+        .where('pointsUsedApplied', '==', true);
+    if (userId) consulta = consulta.where('userId', '==', userId);
+
+    const snap = await consulta.get();
+    return snap.docs
+        .map((d) => ({ docId: d.id, ...d.data() }))
+        .filter((pedido) => pedido.payment === 'mp' && !pedido.mpPaymentId);
+}
+
+// Devuelve los puntos de las reservas que ya vencieron y responde con las
+// que siguen abiertas.
+async function liberarReservasVencidas(userId) {
+    const ahora = new Date();
+    const abiertas = [];
+    let devueltos = 0;
+
+    for (const pedido of await buscarReservasAbiertas(userId)) {
+        const vence = aFecha(pedido.reservaPuntosVence);
+
+        if (vence && vence <= ahora && pedido.mpPagoEnProceso !== true) {
+            const resultado = await cancelarPedidoSinPago(pedido.docId, 'pago_no_realizado', { soloSiVencio: true });
+            if (resultado) {
+                devueltos += resultado.devueltos;
+                console.log('↩️ Pago no realizado, pedido cancelado:', pedido.orderId, '| Puntos devueltos:', resultado.devueltos);
+                continue;
+            }
+        }
+        abiertas.push(pedido);
+    }
+
+    return { abiertas, devueltos };
+}
+
+// Lo mismo, pero sin frenar el pedido que se está armando si la consulta falla.
+async function liberarReservasVencidasSinFallar(userId) {
+    try {
+        await liberarReservasVencidas(userId);
+    } catch (err) {
+        console.error('❌ No se pudieron revisar los puntos reservados:', err.message);
+    }
+}
+
+// Repaso general, para los clientes que no vuelven a entrar a la tienda:
+// al arrancar el servidor y cada 10 minutos mientras esté despierto.
+const REPASO_RESERVAS_MS = 10 * 60 * 1000;
+
+if (db) {
+    setTimeout(() => liberarReservasVencidasSinFallar(null), 15 * 1000).unref();
+    setInterval(() => liberarReservasVencidasSinFallar(null), REPASO_RESERVAS_MS).unref();
 }
 
 // ===================== PUNTOS (Mercado Pago) =====================
@@ -691,20 +834,30 @@ async function aplicarPuntosPedido(pedidoDocId, montoPagado) {
 
         let newPoints = null;
 
+        // Puntos del descuento que el cliente ya no tenía al pagar. Solo
+        // puede pasar si se le devolvieron (pago rechazado o vencido), los
+        // gastó en otro pedido y después pagó este igual. Queda anotado en
+        // el pedido para que el local cobre la diferencia.
+        let pointsFaltantes = 0;
+
         if (pedido.userId) {
             const userRef = db.collection('users').doc(pedido.userId);
             const userSnap = await tx.get(userRef);
 
             if (userSnap.exists) {
                 const currentPoints = Number(userSnap.data().points || 0);
-                newPoints = Math.max(0, currentPoints - aDescontar + pointsEarned);
+                const saldo = currentPoints - aDescontar + pointsEarned;
+                pointsFaltantes = Math.max(0, -saldo);
+                newPoints = Math.max(0, saldo);
                 tx.update(userRef, { points: newPoints });
             }
         }
 
-        tx.update(pedidoRef, { pointsApplied: true, pointsUsedApplied: true, pointsEarned });
+        const cambios = { pointsApplied: true, pointsUsedApplied: true, pointsEarned };
+        if (pointsFaltantes > 0) cambios.pointsFaltantes = pointsFaltantes;
+        tx.update(pedidoRef, cambios);
 
-        return { pointsUsed: aDescontar, pointsEarned, newPoints };
+        return { pointsUsed: aDescontar, pointsEarned, newPoints, pointsFaltantes };
     });
 }
 
@@ -830,6 +983,9 @@ function buildPedidoEmailHtml(pedido, tipo = 'cliente') {
           : pedido.payment === 'mp'
           ? '<strong>Acción requerida:</strong> Ninguna: Mercado Pago ya acreditó el pago.'
           : '<strong>Acción requerida:</strong> El cliente pagará en efectivo al retirar. Los puntos se le acreditan cuando marcás el pedido como entregado.'}
+        ${Number(pedido.pointsFaltantes) > 0
+          ? `<br><strong>⚠️ Atención:</strong> este pedido se pagó con un descuento en puntos que el cliente ya había usado en otro pedido. Faltan cobrar ${money(pedido.pointsFaltantes)}.`
+          : ''}
       </div>
     `;
 
@@ -1048,6 +1204,12 @@ app.post('/crear-preferencia', async (req, res) => {
             return res.status(authError.status || 401).json({ error: authError.message });
         }
 
+        // Si le quedaron puntos reservados en un pago que nunca hizo y ya
+        // venció, vuelven a su saldo antes de calcular este pedido.
+        if (userId && Number(orderData?.pointsUsed) > 0) {
+            await liberarReservasVencidasSinFallar(userId);
+        }
+
         let totalFinal, subtotal, deliveryCost, pointsUsed, distanceKm, distanceApprox, validatedItems;
 
         try {
@@ -1082,29 +1244,52 @@ app.post('/crear-preferencia', async (req, res) => {
 
         const preference = new Preference(mpClient);
 
-        const result = await preference.create({
-            body: {
-                items: mpItems,
-                payer: {
-                    name: customerData.name,
-                    email: customerData.email,
-                    phone: { number: customerData.phone }
-                },
+        const cuerpoPreferencia = {
+            items: mpItems,
+            payer: {
+                name: customerData.name,
+                email: customerData.email,
+                phone: { number: customerData.phone }
+            },
 
-                external_reference: externalReference,
-                statement_descriptor: 'LOBO24',
+            external_reference: externalReference,
+            statement_descriptor: 'LOBO24',
 
-                back_urls: {
-                    success: `${process.env.FRONTEND_URL}/checkout.html?mp_status=success&order=${externalReference}`,
-                    failure: `${process.env.FRONTEND_URL}/checkout.html?mp_status=failure&order=${externalReference}`,
-                    pending: `${process.env.FRONTEND_URL}/checkout.html?mp_status=pending&order=${externalReference}`
-                },
+            back_urls: {
+                success: `${process.env.FRONTEND_URL}/checkout.html?mp_status=success&order=${externalReference}`,
+                failure: `${process.env.FRONTEND_URL}/checkout.html?mp_status=failure&order=${externalReference}`,
+                pending: `${process.env.FRONTEND_URL}/checkout.html?mp_status=pending&order=${externalReference}`
+            },
 
-                auto_return: 'approved',
+            auto_return: 'approved',
 
-                notification_url: `${process.env.BACKEND_URL}/webhook`
+            notification_url: `${process.env.BACKEND_URL}/webhook`
+        };
+
+        // Un pedido con puntos los deja reservados hasta que se pague. Para
+        // que no queden reservados para siempre si el cliente abandona el
+        // pago, el link vence y después se le devuelven (ver PUNTOS
+        // RESERVADOS más arriba). Los pedidos sin puntos no cambian.
+        const reservaPuntos = Boolean(userId) && pointsUsed > 0;
+        const venceLink = new Date(Date.now() + MP_MINUTOS_PARA_PAGAR * 60 * 1000);
+
+        let result;
+        if (reservaPuntos) {
+            try {
+                result = await preference.create({
+                    body: { ...cuerpoPreferencia, expires: true, expiration_date_to: fechaMercadoPago(venceLink) }
+                });
+            } catch (errorVencimiento) {
+                // Antes que dejar al cliente sin poder pagar, se crea el
+                // pago sin vencimiento: los puntos se devuelven igual a los
+                // 35 minutos y, si después paga ese link, se vuelven a
+                // descontar al acreditarse.
+                console.error('⚠️ Mercado Pago no aceptó el pago con vencimiento, se reintenta sin vencimiento:', errorVencimiento.message);
+                result = await preference.create({ body: cuerpoPreferencia });
             }
-        });
+        } else {
+            result = await preference.create({ body: cuerpoPreferencia });
+        }
 
         console.log('✅ Preferencia creada:', result.id, '| Orden:', externalReference);
 
@@ -1117,7 +1302,7 @@ app.post('/crear-preferencia', async (req, res) => {
             ? orderData.contact
             : { ...customerData, ...(orderData?.address || {}) };
 
-        await db.collection('pedidos').add({
+        const pedidoData = {
             orderId: externalReference,
             userId,
             contact,
@@ -1132,12 +1317,43 @@ app.post('/crear-preferencia', async (req, res) => {
             payment: 'mp',
             total: totalFinal,
             status: 'pending_payment',
-            // Nada se descuenta ni se acredita hasta que se acredite el pago.
+            mpPreferenceId: result.id,
+            // El stock y los puntos que gana la compra esperan a que se
+            // acredite el pago. Los puntos que el cliente usa se descuentan
+            // ahora y quedan reservados.
             stockDescontado: false,
-            pointsUsedApplied: false,
+            pointsUsedApplied: reservaPuntos,
             pointsApplied: false,
             createdAt: new Date()
-        });
+        };
+
+        if (reservaPuntos) {
+            pedidoData.reservaPuntosVence = new Date(venceLink.getTime() + RESERVA_MARGEN_MINUTOS * 60 * 1000);
+        }
+
+        const pedidoRef = db.collection('pedidos').doc();
+
+        try {
+            await db.runTransaction(async (tx) => {
+                if (reservaPuntos) {
+                    const userRef = db.collection('users').doc(userId);
+                    const snap = await tx.get(userRef);
+                    const disponibles = snap.exists ? Number(snap.data().points || 0) : 0;
+
+                    if (disponibles < pointsUsed) {
+                        throw Object.assign(
+                            new Error('Tus puntos cambiaron mientras armabas el pedido. Recargá la página y volvé a confirmarlo.'),
+                            { status: 409 }
+                        );
+                    }
+                    tx.update(userRef, { points: disponibles - pointsUsed });
+                }
+                tx.set(pedidoRef, pedidoData);
+            });
+        } catch (err) {
+            if (err.status === 409) return res.status(409).json({ error: err.message });
+            throw err;
+        }
 
         res.json({
             id: result.id,
@@ -1152,19 +1368,76 @@ app.post('/crear-preferencia', async (req, res) => {
     }
 });
 
-// ===================== SINCRONIZAR STOCK (subidas desde sistema-ventas) =====================
-// Las bajas de stock por venta ya se manejan directo con las reglas de
-// Firestore de Lobo24 (mismo mecanismo que usa cualquier compra online: un
-// cliente sin login puede bajar stock, nunca subirlo). Esta ruta es SOLO
-// para subidas (entrada de mercadería en el local) — dejar eso abierto a
-// cualquiera permitiría inflar el stock de un producto sin haber comprado
-// nada, por eso acá sí se verifica de verdad que quien llama es un admin
-// logueado en sistema-ventas en este momento (no alcanza con tener una
-// clave copiada de algún lado).
+// ===================== PUNTOS RESERVADOS (consulta del cliente) =====================
+// La página lo llama al abrir el checkout o "Mis puntos". Devuelve los
+// puntos de los pagos que ya vencieron y avisa cuántos siguen reservados,
+// para que el cliente entienda por qué ve menos puntos de los que esperaba.
+app.post('/puntos-reservados', async (req, res) => {
+    try {
+        let userId;
+        try {
+            userId = await obtenerUidVerificado(req, null);
+        } catch (authError) {
+            return res.status(authError.status || 401).json({ error: authError.message });
+        }
+        if (!userId) return res.status(401).json({ error: 'Iniciá sesión para ver tus puntos.' });
+
+        const { abiertas, devueltos } = await liberarReservasVencidas(userId);
+
+        // El saldo solo se manda si cambió: la página ya lo tiene leído.
+        let points = null;
+        if (devueltos > 0) {
+            const usuario = await firestoreGet('users', userId);
+            points = Number(usuario?.points || 0);
+        }
+
+        res.json({
+            ok: true,
+            points,
+            reservas: abiertas.map((pedido) => ({
+                orderId: pedido.orderId,
+                puntos: Math.max(0, Number(pedido.pointsUsed) || 0),
+                vence: aFecha(pedido.reservaPuntosVence)?.toISOString() || null,
+                pagoEnProceso: pedido.mpPagoEnProceso === true
+            }))
+        });
+    } catch (err) {
+        console.error('❌ Error en /puntos-reservados:', err);
+        res.status(500).json({ error: 'No se pudieron consultar los puntos' });
+    }
+});
+
+// ===================== SINCRONIZAR STOCK (desde sistema-ventas) =====================
+// Todo lo que sistema-ventas cambia en el catálogo de Lobo24 pasa por acá,
+// y siempre se verifica que quien llama está logueado en sistema-ventas en
+// este momento (no alcanza con tener una clave copiada de algún lado):
+//
+//   - Bajar el stock (una venta en el local, una rotura): cualquier usuario
+//     activo de sistema-ventas. Antes las bajas iban directo a Firestore,
+//     con una regla que dejaba bajar el stock de cualquier producto a
+//     cualquier persona sin login; esa regla ya no existe.
+//   - Subir el stock (entrada de mercadería) o cambiar precios: solo un
+//     admin de sistema-ventas.
+//
 // Acepta stock y/o price — el nombre de la ruta quedó del alcance
-// original (solo stock), pero ahora también sincroniza precio: ninguno de
-// los dos se puede tocar sin login en las reglas de Lobo24, así que los
-// dos necesitan pasar por acá, verificados igual.
+// original (solo stock).
+
+// Perfil del usuario de sistema-ventas, guardado unos minutos: una venta
+// avisa el stock de cada producto por separado y no hace falta volver a
+// leerlo en cada aviso.
+const PERFIL_POS_CACHE_MS = 5 * 60 * 1000;
+const perfilesPos = new Map();
+
+async function perfilSistemaVentas(uid) {
+    const guardado = perfilesPos.get(uid);
+    if (guardado && Date.now() - guardado.ts < PERFIL_POS_CACHE_MS) return guardado.perfil;
+
+    const snap = await sistemaVentasDb.collection('usuarios').doc(uid).get();
+    const perfil = snap.exists ? snap.data() : null;
+    perfilesPos.set(uid, { ts: Date.now(), perfil });
+    return perfil;
+}
+
 app.post('/sincronizar-stock-pos', async (req, res) => {
     try {
         if (!sistemaVentasAuth || !sistemaVentasDb || !db) {
@@ -1216,15 +1489,37 @@ app.post('/sincronizar-stock-pos', async (req, res) => {
             return res.status(401).json({ error: 'Token inválido o vencido' });
         }
 
-        const perfilSnap = await sistemaVentasDb.collection('usuarios').doc(decoded.uid).get();
-        const perfil = perfilSnap.exists ? perfilSnap.data() : null;
+        const perfil = await perfilSistemaVentas(decoded.uid);
 
-        if (!perfil || perfil.rol !== 'admin' || perfil.activo === false) {
-            return res.status(403).json({ error: 'Solo un admin de sistema-ventas puede sincronizar' });
+        if (!perfil || perfil.activo === false) {
+            return res.status(403).json({ error: 'Usuario de sistema-ventas inexistente o desactivado' });
         }
 
-        const ok = await firestorePatch(coleccion, docId, fields);
-        if (!ok) return res.status(500).json({ error: 'No se pudo actualizar el producto en Lobo24' });
+        if (perfil.rol === 'admin') {
+            const ok = await firestorePatch(coleccion, docId, fields);
+            if (!ok) return res.status(500).json({ error: 'No se pudo actualizar el producto en Lobo24' });
+            return res.json({ ok: true });
+        }
+
+        // Un vendedor solo puede bajar el stock.
+        if (fields.price !== undefined || fields.priceEfectivo !== undefined || fields.stock === undefined) {
+            return res.status(403).json({ error: 'Solo un admin de sistema-ventas puede cambiar precios' });
+        }
+
+        const productoRef = db.collection(coleccion).doc(docId);
+        const resultado = await db.runTransaction(async (tx) => {
+            const snap = await tx.get(productoRef);
+            if (!snap.exists) return 'no-existe';
+
+            const stockActual = snap.data().stock;
+            if (stockActual === undefined || stockActual === null || fields.stock > Number(stockActual)) return 'sube';
+
+            if (fields.stock < Number(stockActual)) tx.update(productoRef, { stock: fields.stock });
+            return 'ok';
+        });
+
+        if (resultado === 'no-existe') return res.status(404).json({ error: 'El producto ya no existe en Lobo24' });
+        if (resultado === 'sube') return res.status(403).json({ error: 'Solo un admin de sistema-ventas puede subir el stock' });
 
         res.json({ ok: true });
     } catch (err) {
@@ -1262,6 +1557,10 @@ app.post('/confirmar-pedido-manual', async (req, res) => {
             userId = await obtenerUidVerificado(req, req.body?.userId);
         } catch (authError) {
             return res.status(authError.status || 401).json({ error: authError.message });
+        }
+
+        if (userId && Number(pointsUsed) > 0) {
+            await liberarReservasVencidasSinFallar(userId);
         }
 
         let resultado;
@@ -1409,10 +1708,15 @@ app.post('/webhook', async (req, res) => {
 
             // Los puntos tienen su propia marca (pointsApplied), así que
             // se llama siempre: si ya se aplicaron, no hace nada.
+            let pointsFaltantes = 0;
             try {
                 const puntos = await aplicarPuntosPedido(pedido.docId, payInfo.transaction_amount);
                 if (puntos && puntos.newPoints !== null) {
                     console.log('⭐ Puntos aplicados:', `-${puntos.pointsUsed} +${puntos.pointsEarned}`, '| Saldo:', puntos.newPoints);
+                }
+                if (puntos && puntos.pointsFaltantes > 0) {
+                    pointsFaltantes = puntos.pointsFaltantes;
+                    console.log('⚠️ El cliente ya no tenía los puntos del descuento. Faltan cobrar:', pointsFaltantes);
                 }
             } catch (err) {
                 console.error('❌ Error aplicando puntos del pedido:', err.message);
@@ -1428,17 +1732,24 @@ app.post('/webhook', async (req, res) => {
                 await enviarEmailsPedido({
                     ...pedido,
                     status: 'payment_confirmed',
-                    mpPaymentId: String(data.id)
+                    mpPaymentId: String(data.id),
+                    pointsFaltantes
                 });
             }
 
-        } else if (status === 'rejected') {
+        } else if (status === 'rejected' || status === 'cancelled') {
 
-            await cambiarEstadoSiNoEstaPagado(pedido.docId, 'cancelled');
+            // Pago rechazado, o cancelado porque venció: los puntos
+            // reservados vuelven al cliente. Si después paga con otra
+            // tarjeta, se vuelven a descontar al acreditarse.
+            const cancelado = await cancelarPedidoSinPago(pedido.docId, 'pago_rechazado');
+            if (cancelado && cancelado.devueltos > 0) {
+                console.log('↩️ Pago rechazado, puntos devueltos:', cancelado.devueltos);
+            }
 
-        } else if (status === 'pending') {
+        } else if (status === 'pending' || status === 'in_process' || status === 'authorized') {
 
-            await cambiarEstadoSiNoEstaPagado(pedido.docId, 'pending_payment');
+            await marcarPagoEnProceso(pedido.docId);
         }
 
     } catch (err) {
